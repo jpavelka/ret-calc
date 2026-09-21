@@ -2,6 +2,12 @@ import { birthYear } from './age'
 import { activeRanges, resolveIncomeAllocation } from './projection'
 import type { AwiYear, FraRow, Owner, RetirementInputs, SocialSecurityOwnerConfig } from './types'
 
+// Structural echo of YearlyRates from projection.ts (only inflationRatePct is
+// ever used here) — kept local rather than imported to avoid an import cycle,
+// since projection.ts imports from this file. Indexed from currentYear, same
+// as YearlyRates arrays elsewhere: entry i is the rate for currentYear + i.
+type InflationRateOverrides = { inflationRatePct: number }[]
+
 // SSA's benefit formula fixes a worker's Primary Insurance Amount (PIA) using
 // the National Average Wage Index (AWI) as of the year they turn 60 — both
 // for wage-indexing their earnings history, and for the PIA "bend points"
@@ -196,11 +202,21 @@ export function claimingAdjustmentFactor(
 // wages (config.wageSourceIds), and capped at the wage base — the same flat,
 // non-inflation-grown cap projection.ts's own FICA calculation uses, so the
 // two stay consistent with each other.
+// rateOverridesByYear, when supplied, is assumed indexed from `fromYear`
+// (true for this function's only caller, ownerEarningsByYear, which always
+// passes currentYear) — same alignment the main projection loop relies on
+// for its own inflationFactor. A future-projected wage is one more
+// inflation-adjusted amount a Monte Carlo run should grow at that run's own
+// drawn inflation, same as every other inflation-adjusted income source in
+// projection.ts's main loop already does; without this, a simulated run's
+// inflation path would move every dollar figure in the plan except a
+// not-yet-claimed worker's own future SS wages.
 export function projectFutureWages(
   inputs: RetirementInputs,
   owner: Owner,
   fromYear: number,
   throughYear: number,
+  rateOverridesByYear?: InflationRateOverrides,
 ): Map<number, number> {
   const result = new Map<number, number>()
   if (throughYear < fromYear) return result
@@ -209,8 +225,8 @@ export function projectFutureWages(
   if (wageSourceIds.size === 0) return result
   const defsById = new Map(inputs.incomeSourceDefs.map((d) => [d.id, d]))
 
+  let inflationFactor = 1
   for (let year = fromYear; year <= throughYear; year++) {
-    const inflationFactor = Math.pow(1 + inputs.inflationRatePct / 100, year - fromYear)
     let total = 0
     for (const range of activeRanges(inputs.incomeRanges, year)) {
       for (const alloc of range.allocations) {
@@ -221,6 +237,8 @@ export function projectFutureWages(
       }
     }
     result.set(year, Math.min(total, inputs.socialSecurityWageBase))
+    const yearInflationRatePct = rateOverridesByYear?.[year - fromYear]?.inflationRatePct ?? inputs.inflationRatePct
+    inflationFactor *= 1 + yearInflationRatePct / 100
   }
   return result
 }
@@ -229,7 +247,12 @@ export function projectFutureWages(
 // future) are authoritative for whatever year they cover; projected wages
 // (see projectFutureWages) only fill years the user hasn't typed an amount
 // for, through the year before claiming.
-function ownerEarningsByYear(inputs: RetirementInputs, owner: Owner, birthYr: number): Map<number, number> {
+function ownerEarningsByYear(
+  inputs: RetirementInputs,
+  owner: Owner,
+  birthYr: number,
+  rateOverridesByYear?: InflationRateOverrides,
+): Map<number, number> {
   const config = ownerConfig(inputs, owner)
   const currentYear = new Date().getFullYear()
   const earningsByYear = new Map<number, number>()
@@ -242,7 +265,7 @@ function ownerEarningsByYear(inputs: RetirementInputs, owner: Owner, birthYr: nu
   }
   const claimYear = claimYearFor(birthYr, claimAgeMonthsFor(config))
   const projectThroughYear = Math.max(currentYear, claimYear - 1)
-  const projected = projectFutureWages(inputs, owner, currentYear, projectThroughYear)
+  const projected = projectFutureWages(inputs, owner, currentYear, projectThroughYear, rateOverridesByYear)
   for (const [year, wages] of projected) {
     if (!earningsByYear.has(year)) earningsByYear.set(year, wages)
   }
@@ -253,7 +276,11 @@ function ownerEarningsByYear(inputs: RetirementInputs, owner: Owner, birthYr: nu
 // history method), or backed out of the user's SSA-statement estimate
 // (estimate method), so both methods feed the same downstream claiming-age
 // adjustment and COLA logic.
-export function computeOwnerPIA(inputs: RetirementInputs, owner: Owner): number {
+export function computeOwnerPIA(
+  inputs: RetirementInputs,
+  owner: Owner,
+  rateOverridesByYear?: InflationRateOverrides,
+): number {
   const config = ownerConfig(inputs, owner)
   const birthYr = birthYear(ownerBirthDate(inputs, owner))
   if (birthYr === null) return 0
@@ -273,7 +300,7 @@ export function computeOwnerPIA(inputs: RetirementInputs, owner: Owner): number 
   }
 
   const currentYear = new Date().getFullYear()
-  const earningsByYear = ownerEarningsByYear(inputs, owner, birthYr)
+  const earningsByYear = ownerEarningsByYear(inputs, owner, birthYr, rateOverridesByYear)
   const aime = computeAIME(earningsByYear, birthYr, currentYear, ss.awiTable, ss.awiGrowthRatePct)
   return computePIA(aime, computeBendPoints(birthYr, currentYear, ss.awiTable, ss.awiGrowthRatePct))
 }
@@ -290,15 +317,46 @@ export function computeOwnerPIA(inputs: RetirementInputs, owner: Owner): number 
 // later growth step at currentYear, rather than at benefitAnchorYear
 // directly, is what makes "Today's $" mode elsewhere in the app land back
 // on exactly this number instead of a couple years' COLA short of it.
-function monthlyPIAInTodaysDollars(inputs: RetirementInputs, owner: Owner, birthYr: number): number {
+function monthlyPIAInTodaysDollars(
+  inputs: RetirementInputs,
+  owner: Owner,
+  birthYr: number,
+  rateOverridesByYear?: InflationRateOverrides,
+): number {
   const config = ownerConfig(inputs, owner)
   const ss = inputs.socialSecurity
   const currentYear = new Date().getFullYear()
-  const rawPIA = computeOwnerPIA(inputs, owner)
+  const rawPIA = computeOwnerPIA(inputs, owner, rateOverridesByYear)
   const anchorYear = benefitAnchorYear(config, birthYr, currentYear)
+  // anchorYear is always <= currentYear (indexingYear/benefitAnchorYear are
+  // both capped there), so this growth step is entirely over years before
+  // "now" — no simulated draw exists for those, hence always the flat rate,
+  // same as benefitScheduleForOwner's own pre-currentYear catch-up growth.
   const colaRatePct = ss.colaRatePctOverride ?? inputs.inflationRatePct
   const growthToNow = Math.pow(1 + colaRatePct / 100, Math.max(0, currentYear - anchorYear))
   return rawPIA * growthToNow
+}
+
+// Shared COLA-growth step: compounds fromYear-dollars up to toYear-dollars,
+// one year at a time so a Monte Carlo run's per-year draws compound
+// correctly (same reasoning as projection.ts's own inflationFactor). Each
+// year's own rate is what carries its dollars into the *next* year, so the
+// loop covers fromYear..toYear-1 — toYear <= fromYear naturally yields 1
+// with no separate clamp needed. colaRatePctOverride, when set, pins COLA to
+// a fixed rate regardless of any simulated draw, same as elsewhere.
+function colaGrowthFactor(
+  fromYear: number,
+  toYear: number,
+  colaRatePctOverride: number | undefined,
+  inflationRatePct: number,
+  rateOverridesByYear?: InflationRateOverrides,
+): number {
+  let factor = 1
+  for (let year = fromYear; year < toYear; year++) {
+    const yearColaRatePct = colaRatePctOverride ?? rateOverridesByYear?.[year - fromYear]?.inflationRatePct ?? inflationRatePct
+    factor *= 1 + yearColaRatePct / 100
+  }
+  return factor
 }
 
 // The monthly benefit for claiming at a specific age, in that claim year's
@@ -313,10 +371,19 @@ function monthlyPIAInTodaysDollars(inputs: RetirementInputs, owner: Owner, birth
 // computeOwnerBenefitSummary (the configured claiming age) and the
 // claiming-age chart (every age 62-70), so both stay consistent with each
 // other and with benefitScheduleForOwner.
+// rateOverridesByYear, when supplied, drives the currentYear-to-claimYear
+// COLA growth step below — this is the same COLA mechanism as the post-claim
+// growth benefitScheduleForOwner applies year by year, just collapsed into
+// one closed loop here since nothing else depends on the intermediate years.
+// There's no principled reason pre-claim COLA should be immune to a
+// simulation's drawn inflation while post-claim COLA isn't; both apply to
+// the same PIA once a worker is past first eligibility, whether or not
+// they've actually claimed yet.
 export function monthlyBenefitForClaimAgeMonths(
   inputs: RetirementInputs,
   owner: Owner,
   claimAgeMonths: number,
+  rateOverridesByYear?: InflationRateOverrides,
 ): number {
   const birthYr = birthYear(ownerBirthDate(inputs, owner))
   if (birthYr === null) return 0
@@ -331,10 +398,15 @@ export function monthlyBenefitForClaimAgeMonths(
     ss.earlyReductionRateBeyond36MonthsPct,
     ss.delayedCreditRatePct,
   )
-  const monthlyPIAToday = monthlyPIAInTodaysDollars(inputs, owner, birthYr)
+  const monthlyPIAToday = monthlyPIAInTodaysDollars(inputs, owner, birthYr, rateOverridesByYear)
   const claimYear = claimYearFor(birthYr, claimAgeMonths)
-  const colaRatePct = ss.colaRatePctOverride ?? inputs.inflationRatePct
-  const growthToClaim = Math.pow(1 + colaRatePct / 100, Math.max(0, claimYear - currentYear))
+  const growthToClaim = colaGrowthFactor(
+    currentYear,
+    claimYear,
+    ss.colaRatePctOverride,
+    inputs.inflationRatePct,
+    rateOverridesByYear,
+  )
 
   return monthlyPIAToday * factor * growthToClaim
 }
@@ -358,15 +430,22 @@ export function monthlyBenefitForClaimAgeMonths(
 // including for the closed-form catch-up growth applied once here for a
 // claimYear before currentYear, modeling someone who has already been
 // claiming for a while.
+//
+// summary.annualBenefitAtClaim (via computeOwnerBenefitSummary) is itself
+// computed with the same rateOverridesByYear, so a not-yet-claimed worker's
+// pre-claim wage projection and currentYear-to-claimYear COLA also reflect
+// this run's drawn inflation, not just the post-claim growth applied below —
+// otherwise a simulated run's inflation path would move every dollar figure
+// in the plan except this one, right up until the claim year.
 export function benefitScheduleForOwner(
   inputs: RetirementInputs,
   owner: Owner,
   currentYear: number,
   finalYear: number,
-  rateOverridesByYear?: { inflationRatePct: number }[],
+  rateOverridesByYear?: InflationRateOverrides,
 ): Map<number, number> {
   const schedule = new Map<number, number>()
-  const summary = computeOwnerBenefitSummary(inputs, owner)
+  const summary = computeOwnerBenefitSummary(inputs, owner, rateOverridesByYear)
   if (summary === null) return schedule
 
   const ss = inputs.socialSecurity
@@ -412,6 +491,7 @@ export interface SocialSecurityBenefitSummary {
 export function computeOwnerBenefitSummary(
   inputs: RetirementInputs,
   owner: Owner,
+  rateOverridesByYear?: InflationRateOverrides,
 ): SocialSecurityBenefitSummary | null {
   const birthYr = birthYear(ownerBirthDate(inputs, owner))
   if (birthYr === null) return null
@@ -430,15 +510,15 @@ export function computeOwnerBenefitSummary(
   const aime =
     config.benefitMethod === 'earningsHistory'
       ? computeAIME(
-          ownerEarningsByYear(inputs, owner, birthYr),
+          ownerEarningsByYear(inputs, owner, birthYr, rateOverridesByYear),
           birthYr,
           new Date().getFullYear(),
           ss.awiTable,
           ss.awiGrowthRatePct,
         )
       : null
-  const monthlyPIA = monthlyPIAInTodaysDollars(inputs, owner, birthYr)
-  const monthlyBenefitAtClaim = monthlyBenefitForClaimAgeMonths(inputs, owner, claimAgeMonths)
+  const monthlyPIA = monthlyPIAInTodaysDollars(inputs, owner, birthYr, rateOverridesByYear)
+  const monthlyBenefitAtClaim = monthlyBenefitForClaimAgeMonths(inputs, owner, claimAgeMonths, rateOverridesByYear)
 
   return {
     fraMonths,
