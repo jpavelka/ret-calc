@@ -1,6 +1,7 @@
 import { Fragment, useState, type ReactNode } from 'react'
 import { CellHelp } from './CellHelp'
 import { HelpTooltip } from './HelpTooltip'
+import { savingsLineKey } from './projection'
 import type { AccountFlow, InvestmentAccountKey, YearlyRates, YearProjectionRow } from './projection'
 import { nominalReturnPct } from './simulation'
 import type { BracketBreakdownEntry } from './tax'
@@ -336,17 +337,19 @@ export function ProjectionSectionHeading() {
         text={
           'Each year: income pays taxes, then the savings plan, then expenses. ' +
           'Whatever is left over is swept into the taxable brokerage account. ' +
-          'If income falls short, the difference is drawn in a fixed order — cash, then ' +
-          'high-yield savings, then taxable brokerage, then pre-tax, then Roth, then HSA, then ' +
-          '529 — and the amount drawn is grossed up to cover the tax it triggers, since a ' +
-          'withdrawal can itself be taxable. Selling from the taxable account realizes a ' +
-          'long-term capital gain on the proportion of the balance that is not cost basis. ' +
-          'Pre-tax withdrawals are ordinary income. Roth comes out basis first, and once the ' +
-          'owner reaches 59½ the earnings are tax-free too; before that they are ordinary ' +
-          'income. HSA withdrawals are ordinary income, since qualified medical expenses are ' +
-          'not tracked yet. 529 withdrawals up to that year’s education-related spending are ' +
-          'federal- and state-tax-free regardless of basis; any remainder’s earnings share is ' +
-          'ordinary income plus a flat 10% federal penalty, with no age exemption. Withdrawing ' +
+          'If income falls short, the difference is drawn in a fixed order — first, that ' +
+          'year’s medical-related spending comes out of the HSA and education-related ' +
+          'spending out of the 529 (both tax-free, up to what’s available), then cash, then ' +
+          'high-yield savings, then taxable brokerage, then pre-tax, then Roth, then whatever ' +
+          'is left of the HSA, then the 529 — and the amount drawn is grossed up to cover the ' +
+          'tax it triggers, since a withdrawal can itself be taxable. Selling from the taxable ' +
+          'account realizes a long-term capital gain on the proportion of the balance that is ' +
+          'not cost basis. Pre-tax withdrawals are ordinary income. Roth comes out basis ' +
+          'first, and once the owner reaches 59½ the earnings are tax-free too; before that ' +
+          'they are ordinary income. HSA withdrawals beyond that year’s medical-related ' +
+          'spending are ordinary income. 529 withdrawals beyond that year’s education-related ' +
+          'spending have their earnings share taxed as ordinary income plus a flat 10% ' +
+          'federal penalty, with no age exemption. Withdrawing ' +
           'pre-tax or Roth before 59½ adds a 10% penalty (20% on an HSA before 65) — the whole ' +
           'year counts as penalty-free once the birthday falls in it. If every account runs dry ' +
           'the remainder still comes out of cash, which can go negative. ' +
@@ -659,65 +662,6 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   return rows
 }
 
-// Per-account breakdown of what the default withdrawal rule drew this year.
-// "Unfunded" is the part no account could cover, which drives cash negative.
-function withdrawalRows(row: YearProjectionRow, spouseEnabled: boolean): BreakdownRow[] {
-  const items: BreakdownRow[] = [
-    { label: 'Cash', amount: row.withdrawals.fromCash },
-    { label: 'HYSA', amount: row.accountFlows.hysa.withdrawals },
-    { label: 'Taxable', amount: row.accountFlows.taxable.withdrawals },
-    {
-      // accountFlows.preTaxSelf.withdrawals also includes this year's Roth
-      // conversion (needed for the Detailed table's balance reconciliation),
-      // which isn't a withdrawal rule draw — netted back out here so this
-      // stays scoped to what the default rule actually drew.
-      label: spouseEnabled ? 'Pre-tax (You)' : 'Pre-tax',
-      amount: row.accountFlows.preTaxSelf.withdrawals - row.rothConversion.self,
-    },
-    ...(spouseEnabled
-      ? [
-          {
-            label: 'Pre-tax (Spouse)',
-            amount: row.accountFlows.preTaxSpouse.withdrawals - row.rothConversion.spouse,
-          },
-        ]
-      : []),
-    { label: spouseEnabled ? 'Roth (You)' : 'Roth', amount: row.accountFlows.rothSelf.withdrawals },
-    ...(spouseEnabled ? [{ label: 'Roth (Spouse)', amount: row.accountFlows.rothSpouse.withdrawals }] : []),
-    { label: 'HSA', amount: row.accountFlows.hsa.withdrawals },
-    { label: '529', amount: row.accountFlows.college529.withdrawals },
-  ].filter((item) => item.amount > 0)
-
-  if (items.length === 0 && row.withdrawals.unfunded === 0) return []
-
-  const rows = [...items]
-  if (row.withdrawals.unfunded > 0) {
-    rows.push({ label: 'Unfunded', amount: row.withdrawals.unfunded, warn: true })
-  }
-  if (row.withdrawals.rmd.self > 0) {
-    rows.push({
-      label: `of which required minimum distribution${spouseEnabled ? ' (You)' : ''}`,
-      amount: row.withdrawals.rmd.self,
-      sub: true,
-      section: true,
-    })
-  }
-  if (row.withdrawals.rmd.spouse > 0) {
-    rows.push({
-      label: `of which required minimum distribution${spouseEnabled ? ' (Spouse)' : ''}`,
-      amount: row.withdrawals.rmd.spouse,
-      sub: true,
-    })
-  }
-  if (row.withdrawals.capitalGains > 0) {
-    rows.push({ label: 'Gains realized', amount: row.withdrawals.capitalGains, sub: true, section: true })
-  }
-  if (row.withdrawals.ordinaryIncome > 0) {
-    rows.push({ label: 'Taxed as income', amount: row.withdrawals.ordinaryIncome, sub: true })
-  }
-  return rows
-}
-
 // Sums each investment account's contributions/withdrawals/growth into one
 // total — the same three numbers Net worth's cell shows, aggregated across
 // every account rather than per-account.
@@ -769,7 +713,6 @@ const standardColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   116,
   116,
   116,
-  178,
   126,
   126,
   126,
@@ -839,7 +782,6 @@ function StandardTable({
             <th className="py-2 pr-3 text-right">Savings</th>
             <th className="py-2 pr-3 text-right">Match</th>
             <th className="py-2 pr-3 text-right">Taxes</th>
-            <th className="py-2 pr-3 text-right">To taxable / withdrawn</th>
             <th className="py-2 pr-3 text-right">Pre-tax</th>
             <th className="py-2 pr-3 text-right">Roth</th>
             <th className="py-2 pr-3 text-right">Taxable</th>
@@ -852,21 +794,6 @@ function StandardTable({
         </thead>
         <tbody>
           {rows.map((row, i) => {
-            // Negative shows the whole gap that had to be funded, including any
-            // part no account could cover.
-            const net = row.extraTaxableSavings - (row.withdrawals.total + row.withdrawals.unfunded)
-
-            const withdrawalDetail = withdrawalRows(row, spouseEnabled)
-            const netCellRows: BreakdownRow[] = [
-              { label: 'To taxable (leftover swept in)', amount: row.extraTaxableSavings },
-              { label: 'Withdrawn (default rule)', amount: row.withdrawals.total },
-              ...(row.withdrawals.unfunded > 0
-                ? [{ label: 'Unfunded', amount: row.withdrawals.unfunded, warn: true }]
-                : []),
-              { label: 'Net', amount: net, derived: true, section: true },
-              ...withdrawalDetail.map((r, idx) => (idx === 0 ? { ...r, section: true } : r)),
-            ]
-
             const preTaxRows = spouseEnabled
               ? [
                   ...accountRows('Pre-tax (You)', row.accountFlows.preTaxSelf, row.balances.preTaxSelf),
@@ -995,9 +922,6 @@ function StandardTable({
                 </ValueCell>
                 <ValueCell value={`$${fmt(row.totalTax)}`} label="Taxes">
                   <BreakdownList rows={taxBreakdownRows(row)} />
-                </ValueCell>
-                <ValueCell value={<Money value={net} highlightNegative />} label="To taxable / withdrawn">
-                  <BreakdownList rows={netCellRows} />
                 </ValueCell>
                 <ValueCell
                   value={`$${fmt(row.balances.preTaxSelf + row.balances.preTaxSpouse)}`}
@@ -1157,25 +1081,58 @@ function DetailedTable({
   rates?: YearlyRates[]
 }) {
   const spouseEnabled = inputs.spouseEnabled
-  const catalogIncomeIds = new Set(inputs.incomeSourceDefs.map((d) => d.id))
-  const catalogExpenseIds = new Set(inputs.spendingBucketDefs.map((d) => d.id))
+  // A variable can be used by income lines, spending lines, both, or
+  // neither — each group's fixed columns are the variables actually used by
+  // that domain, not the whole shared catalog, so e.g. a spending-only
+  // variable doesn't grow an always-zero Income column.
+  const usedIncomeVariableIds = new Set(
+    inputs.incomeRanges
+      .flatMap((r) => r.allocations ?? [])
+      .flatMap((a) => (a.source.kind === 'variable' ? [a.source.variableId] : [])),
+  )
+  const usedExpenseVariableIds = new Set(
+    inputs.spendingRanges
+      .flatMap((r) => r.allocations ?? [])
+      .flatMap((a) => (a.source.kind === 'variable' ? [a.source.variableId] : [])),
+  )
+  const catalogIncomeIds = usedIncomeVariableIds
+  const catalogExpenseIds = usedExpenseVariableIds
+  const incomeColumns = inputs.variables.filter((v) => usedIncomeVariableIds.has(v.id))
+  const expenseColumns = inputs.variables.filter((v) => usedExpenseVariableIds.has(v.id))
 
-  // Custom lines aren't tied to any catalog def, so they can't get their own
-  // fixed column the way a def can — they're pooled into one "Custom" column
-  // instead, keeping every column in the group additive up to Total. Their
-  // individual names/amounts are still visible in Standard view's expandable
-  // per-year breakdown.
+  // Savings lines have no catalog to draw fixed columns from — they're
+  // defined directly per range (see SavingsPlanRange) — so the column list is
+  // derived from the ranges themselves instead, in definition order,
+  // deduplicated by savingsLineKey (the same name-based key projection.ts
+  // groups contributions by) so the same-named line redefined across several
+  // ranges still gets one stable column.
+  const savingsColumns: { id: string; name: string }[] = []
+  const seenSavingsKeys = new Set<string>()
+  for (const range of inputs.savingsRanges) {
+    for (const line of range.lines) {
+      const key = savingsLineKey(line)
+      if (seenSavingsKeys.has(key)) continue
+      seenSavingsKeys.add(key)
+      savingsColumns.push({ id: key, name: line.name })
+    }
+  }
+
+  // Custom lines aren't tied to any variable, so they can't get their own
+  // fixed column the way a variable can — they're pooled into one "Custom"
+  // column instead, keeping every column in the group additive up to Total.
+  // Their individual names/amounts are still visible in Standard view's
+  // expandable per-year breakdown.
   const incomeGroup: ColumnGroup = {
     label: 'Income',
     columns: [
-      ...inputs.incomeSourceDefs.map((d) => ({ key: d.id, label: d.name || 'Untitled' })),
+      ...incomeColumns.map((v) => ({ key: v.id, label: v.name || 'Untitled' })),
       { key: 'custom', label: 'Custom' },
       { key: 'total', label: 'Total', total: true },
     ],
   }
   // Never part of incomeGroup above — it's a separate income stream that
   // bypasses payroll tax and ordinary-income treatment entirely (see
-  // projection.ts), so it isn't one of incomeSourceDefs' columns.
+  // projection.ts), so it isn't one of the income group's variable columns.
   const socialSecurityGroup: ColumnGroup = {
     label: 'Social Security',
     columns: [
@@ -1195,7 +1152,7 @@ function DetailedTable({
   const expenseGroup: ColumnGroup = {
     label: 'Expenses',
     columns: [
-      ...inputs.spendingBucketDefs.map((d) => ({ key: d.id, label: d.name || 'Untitled' })),
+      ...expenseColumns.map((v) => ({ key: v.id, label: v.name || 'Untitled' })),
       { key: 'custom', label: 'Custom' },
       { key: 'total', label: 'Total', total: true },
     ],
@@ -1203,7 +1160,7 @@ function DetailedTable({
   const savingsGroup: ColumnGroup = {
     label: 'Savings (+ match)',
     columns: [
-      ...inputs.savingsLineDefs.map((d) => ({ key: d.id, label: d.name || 'Untitled' })),
+      ...savingsColumns.map((d) => ({ key: d.id, label: d.name || 'Untitled' })),
       { key: 'total', label: 'Total', total: true },
     ],
   }
@@ -1518,12 +1475,12 @@ function DetailedTable({
                   </>
                 )}
 
-                {inputs.incomeSourceDefs.map((d, i) => (
+                {incomeColumns.map((d, i) => (
                   <td key={d.id} className={`py-1 px-2 text-right text-slate-700 ${i === 0 ? 'border-l border-slate-100' : ''}`}>
                     ${fmt(incomeById.get(d.id) ?? 0)}
                   </td>
                 ))}
-                <td className={`py-1 px-2 text-right text-slate-700 ${inputs.incomeSourceDefs.length === 0 ? 'border-l border-slate-100' : ''}`}>
+                <td className={`py-1 px-2 text-right text-slate-700 ${incomeColumns.length === 0 ? 'border-l border-slate-100' : ''}`}>
                   {customIncomeTotal !== 0 ? `$${fmt(customIncomeTotal)}` : '–'}
                 </td>
                 <td className="py-1 px-2 text-right font-medium text-slate-900">${fmt(row.incomeTotal)}</td>
@@ -1548,17 +1505,17 @@ function DetailedTable({
                 )}
                 <td className="py-1 px-2 text-right font-medium text-slate-900">${fmt(row.socialSecurity.total)}</td>
 
-                {inputs.spendingBucketDefs.map((d, i) => (
+                {expenseColumns.map((d, i) => (
                   <td key={d.id} className={`py-1 px-2 text-right text-slate-700 ${i === 0 ? 'border-l border-slate-100' : ''}`}>
                     ${fmt(expenseById.get(d.id) ?? 0)}
                   </td>
                 ))}
-                <td className={`py-1 px-2 text-right text-slate-700 ${inputs.spendingBucketDefs.length === 0 ? 'border-l border-slate-100' : ''}`}>
+                <td className={`py-1 px-2 text-right text-slate-700 ${expenseColumns.length === 0 ? 'border-l border-slate-100' : ''}`}>
                   {customExpenseTotal !== 0 ? `$${fmt(customExpenseTotal)}` : '–'}
                 </td>
                 <td className="py-1 px-2 text-right font-medium text-slate-900">${fmt(row.expenseTotal)}</td>
 
-                {inputs.savingsLineDefs.map((d, i) => {
+                {savingsColumns.map((d, i) => {
                   const s = savingsById.get(d.id)
                   return (
                     <td key={d.id} className={`py-1 px-2 text-right text-slate-700 ${i === 0 ? 'border-l border-slate-100' : ''}`}>
@@ -1703,12 +1660,12 @@ function DetailedTable({
               </>
             )}
 
-            {inputs.incomeSourceDefs.map((d, i) => (
+            {incomeColumns.map((d, i) => (
               <td key={d.id} className={`py-1 px-2 text-right ${i === 0 ? 'border-l border-slate-100' : ''}`}>
                 ${fmt(totalIncomeBySource.get(d.id) ?? 0)}
               </td>
             ))}
-            <td className={`py-1 px-2 text-right ${inputs.incomeSourceDefs.length === 0 ? 'border-l border-slate-100' : ''}`}>
+            <td className={`py-1 px-2 text-right ${incomeColumns.length === 0 ? 'border-l border-slate-100' : ''}`}>
               {totalCustomIncome !== 0 ? `$${fmt(totalCustomIncome)}` : '–'}
             </td>
             <td className="py-1 px-2 text-right text-slate-900">${fmt(totalIncomeAll)}</td>
@@ -1731,17 +1688,17 @@ function DetailedTable({
             )}
             <td className="py-1 px-2 text-right text-slate-900">${fmt(totalSocialSecurityAll)}</td>
 
-            {inputs.spendingBucketDefs.map((d, i) => (
+            {expenseColumns.map((d, i) => (
               <td key={d.id} className={`py-1 px-2 text-right ${i === 0 ? 'border-l border-slate-100' : ''}`}>
                 ${fmt(totalExpenseByBucket.get(d.id) ?? 0)}
               </td>
             ))}
-            <td className={`py-1 px-2 text-right ${inputs.spendingBucketDefs.length === 0 ? 'border-l border-slate-100' : ''}`}>
+            <td className={`py-1 px-2 text-right ${expenseColumns.length === 0 ? 'border-l border-slate-100' : ''}`}>
               {totalCustomExpense !== 0 ? `$${fmt(totalCustomExpense)}` : '–'}
             </td>
             <td className="py-1 px-2 text-right text-slate-900">${fmt(totalExpenseAll)}</td>
 
-            {inputs.savingsLineDefs.map((d, i) => {
+            {savingsColumns.map((d, i) => {
               const s = totalSavingsByLine.get(d.id)
               return (
                 <td key={d.id} className={`py-1 px-2 text-right ${i === 0 ? 'border-l border-slate-100' : ''}`}>

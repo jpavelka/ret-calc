@@ -1,5 +1,6 @@
 import { birthYear } from './age'
-import { activeRanges, resolveIncomeAllocation } from './projection'
+import { activeRanges, resolveAllocation } from './projection'
+import { resolveVariableAmounts } from './variables'
 import type { AwiYear, FraRow, Owner, RetirementInputs, SocialSecurityOwnerConfig } from './types'
 
 // Structural echo of YearlyRates from projection.ts (only inflationRatePct is
@@ -197,9 +198,9 @@ export function claimingAdjustmentFactor(
 
 // Projects one owner's Social-Security-taxable wages for years not yet
 // entered in their earnings history, using the same income-range resolution
-// the main projection loop uses (activeRanges/resolveIncomeAllocation),
-// filtered to whichever income sources the user tagged as this owner's SS
-// wages (config.wageSourceIds), and capped at the wage base — the same flat,
+// the main projection loop uses (activeRanges/resolveAllocation), filtered to
+// whichever variables the user tagged as this owner's SS wages
+// (config.wageVariableIds), and capped at the wage base — the same flat,
 // non-inflation-grown cap projection.ts's own FICA calculation uses, so the
 // two stay consistent with each other.
 // rateOverridesByYear, when supplied, is assumed indexed from `fromYear`
@@ -221,17 +222,18 @@ export function projectFutureWages(
   const result = new Map<number, number>()
   if (throughYear < fromYear) return result
   const config = ownerConfig(inputs, owner)
-  const wageSourceIds = new Set(config.wageSourceIds)
-  if (wageSourceIds.size === 0) return result
-  const defsById = new Map(inputs.incomeSourceDefs.map((d) => [d.id, d]))
+  const wageVariableIds = new Set(config.wageVariableIds)
+  if (wageVariableIds.size === 0) return result
+  const variablesById = new Map(inputs.variables.map((v) => [v.id, v]))
+  const resolvedVariableAmounts = resolveVariableAmounts(inputs.variables).amounts
 
   let inflationFactor = 1
   for (let year = fromYear; year <= throughYear; year++) {
     let total = 0
     for (const range of activeRanges(inputs.incomeRanges, year)) {
       for (const alloc of range.allocations) {
-        if (!alloc.sourceId || !wageSourceIds.has(alloc.sourceId)) continue
-        const resolved = resolveIncomeAllocation(alloc, defsById)
+        if (alloc.source.kind !== 'variable' || !wageVariableIds.has(alloc.source.variableId)) continue
+        const resolved = resolveAllocation(alloc, variablesById, resolvedVariableAmounts)
         if (!resolved) continue
         total += resolved.inflationAdjusted ? resolved.amount * inflationFactor : resolved.amount
       }
@@ -347,7 +349,7 @@ function monthlyPIAInTodaysDollars(
 function colaGrowthFactor(
   fromYear: number,
   toYear: number,
-  colaRatePctOverride: number | undefined,
+  colaRatePctOverride: number | null | undefined,
   inflationRatePct: number,
   rateOverridesByYear?: InflationRateOverrides,
 ): number {

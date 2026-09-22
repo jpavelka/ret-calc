@@ -122,18 +122,17 @@ export interface RetirementInputs {
   // Named years (e.g. "Retirement") that a range's start/end can link to,
   // so changing the special year's value updates every range that uses it.
   specialYears: SpecialYear[]
-  // Named catalogs of income sources / spending buckets / savings lines /
-  // withdrawal lines. Year ranges reference these by id — the name (and, for
-  // savings/withdrawal lines, account, owner, and any employer match) are
-  // defined once here instead of per range.
-  incomeSourceDefs: IncomeSourceDef[]
-  spendingBucketDefs: SpendingBucketDef[]
-  savingsLineDefs: SavingsLineDef[]
+  // Named dollar amounts, reusable from any income/spending/savings line —
+  // e.g. a variable "Regular spending" = $120,000 that a spending line can
+  // reference as a yearly or monthly figure. The single source of truth for
+  // a dollar value; a line can also skip this and hold its own custom amount.
+  variables: Variable[]
   withdrawalLineDefs: WithdrawalLineDef[]
-  // Named, ordered sequences of savings/withdrawal lines (a whole waterfall
-  // priority given a name, e.g. "Standard priority"). Year ranges reference
-  // one of these by id instead of assembling the order from scratch.
-  savingsPrioritySets: SavingsPrioritySet[]
+  // Named, ordered sequences of withdrawal lines (a whole waterfall priority
+  // given a name, e.g. "Standard priority"). Year ranges reference one of
+  // these by id instead of assembling the order from scratch. Savings has no
+  // catalog/priority-set equivalent — each SavingsPlanRange defines its own
+  // lines directly (see SavingsLine/SavingsPlanRange).
   withdrawalPrioritySets: WithdrawalPrioritySet[]
   // Each domain has its own independent set of year ranges — they don't need
   // to share boundaries, so e.g. your income ranges can differ from your
@@ -204,13 +203,13 @@ export interface SocialSecurityOwnerConfig {
   estimatedBenefitAge: number
   // "earningsHistory" method: manually entered actual past years.
   earningsHistory: SocialSecurityEarningsYear[]
-  // "earningsHistory" method: which of inputs.incomeSourceDefs count as this
+  // "earningsHistory" method: which of inputs.variables count as this
   // owner's Social-Security-taxable wages for years not yet entered above
   // (today through claiming age) — referenced by id, same pattern as
-  // SavingsPrioritySet.lineIds. Those sources' projected amounts (from
-  // incomeRanges, capped at each year's wage base) fill in the future years
-  // of the earnings history automatically.
-  wageSourceIds: string[]
+  // WithdrawalPrioritySet.lineIds. Those variables' projected income-allocation
+  // amounts (from incomeRanges, capped at each year's wage base) fill in the
+  // future years of the earnings history automatically.
+  wageVariableIds: string[]
 }
 
 export interface SocialSecurityInputs {
@@ -286,7 +285,7 @@ export interface RmdDivisor {
 // A state income tax deduction sized to contributions into a specific
 // account type, e.g. Kansas's 529 deduction. `perBeneficiaryCap` is a flat
 // dollar figure (not inflation-scaled), matching how the contribution
-// amounts it's compared against (SavingsLineDef.amount) are also held flat.
+// amounts it's compared against are also held flat.
 export interface StateContributionDeduction {
   id: string
   name: string
@@ -308,37 +307,68 @@ export interface MatchTier {
 }
 
 export interface MatchConfig {
-  // References an IncomeSourceDef; the tier percentages are calculated
-  // against whatever amount that source is given in a particular range.
-  incomeSourceId: string | null
+  // References a Variable; the tier percentages are calculated against
+  // whatever amount that variable currently holds. A custom (non-variable)
+  // income line has no stable cross-range identity to sum a salary against,
+  // so it can't back a match — only a Variable can.
+  wageVariableId: string | null
   // Applied in order: the first tier's slice of salary, then the next, etc.
   tiers: MatchTier[]
 }
 
-export interface IncomeSourceDef {
+// How a Variable's own dollar amount is supplied: a flat number, or a
+// formula over other variables (referenced by name, e.g. "0.1 * salary") —
+// see resolveVariableAmounts in variables.ts, which resolves the resulting
+// dependency graph (and catches circular references) once per variables
+// list.
+export type VariableSource = { kind: 'custom'; amount: number } | { kind: 'formula'; expression: string }
+
+// A named amount, reusable from any income/spending/savings line. Not
+// necessarily a dollar figure — it may back a formula elsewhere that derives
+// a percentage, a count, or any other quantity — so it carries no currency
+// formatting or inflation-adjustment assumption of its own. A use that
+// treats it as a dollar amount (see AmountSource's 'variable' kind) decides
+// inflation-adjustment there, per use.
+export interface Variable {
   id: string
   name: string
-  // Always in today's dollars. Grown for inflation in future years only when
-  // inflationAdjusted is true — otherwise held flat in nominal dollars.
-  amount: number
-  inflationAdjusted: boolean
+  source: VariableSource
 }
 
-export interface SpendingBucketDef {
-  id: string
-  name: string
-  // Always in today's dollars. Grown for inflation in future years only when
-  // inflationAdjusted is true — otherwise held flat in nominal dollars.
-  amount: number
-  inflationAdjusted: boolean
-  // Marks this bucket's spending as a qualified education expense, so a 529
-  // withdrawal can cover it tax- and penalty-free. Optional for backward
-  // compatibility with scenarios saved before this field existed — read as
-  // `?? false` wherever it's consumed.
-  educationRelated?: boolean
-}
+export type Frequency = 'monthly' | 'yearly'
 
-export interface SavingsLineDef {
+// How a line item's dollar amount is supplied: a reference to a Variable
+// (whose resolved amount is read live, so it can never drift from the
+// variable — but a Variable isn't necessarily a dollar figure, so this kind
+// carries its own inflation flag, same as 'custom'/'formula' below), a
+// one-off custom amount with its own inflation flag, or a formula over the
+// variables catalog (its own inflation flag, same reasoning). Either way,
+// `frequency` says whether the number is a monthly or yearly figure — chosen
+// per line, not per variable, so the same variable can be used as a yearly
+// amount in one place and monthly in another.
+export type AmountSource =
+  | { kind: 'variable'; variableId: string; inflationAdjusted: boolean; frequency: Frequency }
+  | { kind: 'custom'; amount: number; inflationAdjusted: boolean; frequency: Frequency }
+  | { kind: 'formula'; expression: string; inflationAdjusted: boolean; frequency: Frequency }
+  // No fixed periodic amount of its own — only meaningful on a SavingsLine
+  // with a `goal`, where it means "contribute whatever it takes to reach the
+  // goal," rather than being bounded by a per-period figure. No frequency or
+  // inflation flag: neither applies to an amount that isn't periodic (the
+  // goal's own inflationAdjusted flag already governs the target it fills
+  // toward). Without a goal it's a no-op (contributes nothing of its own).
+  | { kind: 'unlimited' }
+
+// A point-in-time target balance — like AmountSource but with no `frequency`,
+// since a goal is "reach $X", not "$X per year/month".
+export type GoalTarget =
+  | { kind: 'variable'; variableId: string; inflationAdjusted: boolean }
+  | { kind: 'custom'; amount: number; inflationAdjusted: boolean }
+  | { kind: 'formula'; expression: string; inflationAdjusted: boolean }
+
+// A savings line, defined directly inside the range it applies to — there's
+// no catalog to draw from (see SavingsPlanRange below). Its account/owner/
+// match/source live and are edited entirely within that one range.
+export interface SavingsLine {
   id: string
   name: string
   account: AccountType
@@ -348,10 +378,19 @@ export interface SavingsLineDef {
   owner: Owner
   // Employer match policy for this line, if any.
   match: MatchConfig | null
-  // Default amount to save into this line, in today's dollars. Used to seed
-  // a range's allocation for this line when it's first added to a priority
-  // set — each range's amount can still be overridden from there.
-  amount: number
+  source: AmountSource
+  // Contributions to this line stop once its account balance reaches this
+  // target; any amount that would have exceeded it cascades to fund the next
+  // line(s) in this range's list instead (see runProjection's savings pass).
+  // Optional for backward compatibility with scenarios saved before this
+  // field existed — read as `?? null` wherever it's consumed.
+  goal?: GoalTarget | null
+  // Boolean formula gating whether this line applies in a given year (e.g.
+  // "year < 2040"), evaluated against the normal Variable scope plus an
+  // injected `year`. null/undefined/empty = always applies (subject only to
+  // the enclosing range's own startYear/endYear). Optional for backward
+  // compatibility; read as `?? null` wherever it's consumed.
+  condition?: string | null
 }
 
 export interface WithdrawalLineDef {
@@ -364,13 +403,6 @@ export interface WithdrawalLineDef {
   owner: Owner
 }
 
-export interface SavingsPrioritySet {
-  id: string
-  name: string
-  // Ordered SavingsLineDef ids — the first is funded first, then the next.
-  lineIds: string[]
-}
-
 export interface WithdrawalPrioritySet {
   id: string
   name: string
@@ -378,38 +410,34 @@ export interface WithdrawalPrioritySet {
   lineIds: string[]
 }
 
-// A one-off line inside a plan range that isn't tied to any catalog def —
-// carries its own name/amount/inflation flag, the same three things a
-// catalog def would otherwise supply.
-export interface CustomAllocationAmount {
-  name: string
-  // Always in today's dollars — grown for inflation.
-  amount: number
-  inflationAdjusted: boolean
-}
-
-// Exactly one of sourceId/custom is set. When sourceId references a catalog
-// income source, its amount is used as-is — there's no separate stored
-// amount here, so it can never drift from the catalog. custom holds the
-// line's own name/amount/inflation flag when it isn't tied to a source.
+// A named line item inside a plan range — e.g. "Base" spending $120,000/year,
+// sourced from a Variable or a custom one-off amount (see AmountSource).
 export interface IncomeAllocation {
   id: string
-  sourceId: string | null
-  custom: CustomAllocationAmount | null
+  name: string
+  source: AmountSource
 }
 
-// Exactly one of bucketId/custom is set — see IncomeAllocation.
 export interface SpendingAllocation {
   id: string
-  bucketId: string | null
-  custom: CustomAllocationAmount | null
+  name: string
+  source: AmountSource
+  // Marks this line's spending as a qualified education expense, so a 529
+  // withdrawal can cover it tax- and penalty-free. Optional for backward
+  // compatibility with scenarios saved before this field existed — read as
+  // `?? false` wherever it's consumed.
+  educationRelated?: boolean
+  // Marks this line's spending as a qualified medical expense, so an HSA
+  // withdrawal can cover it tax-free. Optional for backward compatibility
+  // with scenarios saved before this field existed — read as `?? false`
+  // wherever it's consumed.
+  medicalRelated?: boolean
 }
 
 export interface PriorityAllocation {
   id: string
   lineId: string | null
-  // Always a non-negative dollar amount, in today's dollars.
-  amount: number
+  source: AmountSource
 }
 
 // Shared by every domain's plan ranges. Ranges are always stored as actual
@@ -437,11 +465,9 @@ export interface SpendingPlanRange extends PlanRangeBounds {
 }
 
 export interface SavingsPlanRange extends PlanRangeBounds {
-  // Which named savings priority applies to this range, if any. allocations
-  // is kept in sync with that set's lineIds/order — only each line's amount
-  // is edited per range.
-  prioritySetId: string | null
-  allocations: PriorityAllocation[]
+  // Ordered — the first line is funded first, then the next ("layered").
+  // Defined directly on the range; no shared catalog to draw from.
+  lines: SavingsLine[]
 }
 
 export interface WithdrawalPlanRange extends PlanRangeBounds {
@@ -669,7 +695,7 @@ function defaultSocialSecurityOwnerConfig(): SocialSecurityOwnerConfig {
     estimatedMonthlyBenefit: 0,
     estimatedBenefitAge: 67,
     earningsHistory: [],
-    wageSourceIds: [],
+    wageVariableIds: [],
   }
 }
 
@@ -721,11 +747,8 @@ export const DEFAULT_INPUTS: RetirementInputs = {
     shared: { ...EMPTY_SHARED_BALANCES },
   },
   specialYears: [],
-  incomeSourceDefs: [],
-  spendingBucketDefs: [],
-  savingsLineDefs: [],
+  variables: [],
   withdrawalLineDefs: [],
-  savingsPrioritySets: [],
   withdrawalPrioritySets: [],
   incomeRanges: [],
   spendingRanges: [],

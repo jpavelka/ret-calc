@@ -1,33 +1,38 @@
+import type { FormulaHistoryContext } from './formula'
 import { PlanRangesEditor } from './PlanRangesEditor'
 import { SpendingAllocationsEditor } from './SpendingAllocationsEditor'
-import type { SpecialYear, SpendingBucketDef, SpendingPlanRange } from './types'
+import type { SpecialYear, SpendingPlanRange, Variable } from './types'
 import type { YearDisplayMode } from './useYearDisplayMode'
 
 interface SpendingRangesEditorProps {
   ranges: SpendingPlanRange[]
   onChange: (ranges: SpendingPlanRange[]) => void
-  spendingBucketDefs: SpendingBucketDef[]
+  variables: Variable[]
+  resolvedVariableAmounts: Map<string, number>
   birthYear: number | null
   deathYear: number | null
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
+  history?: FormulaHistoryContext
 }
 
 export function SpendingRangesEditor({
   ranges,
   onChange,
-  spendingBucketDefs,
+  variables,
+  resolvedVariableAmounts,
   birthYear,
   deathYear,
   specialYears,
   mode,
   bare = false,
+  history,
 }: SpendingRangesEditorProps) {
   return (
     <PlanRangesEditor
       title={bare ? 'Plan' : 'Spending plan'}
-      description="Add a range for each period with different spending, then set an amount for each spending bucket that applies. Ranges can overlap — where they do, all overlapping ranges' spending applies."
+      description="Add a range for each period with different spending, then add a named line for each spending item that applies. Ranges can overlap — where they do, all overlapping ranges' spending applies."
       emptyMessage="No spending ranges yet — add one to specify spending for a period."
       addLabel="Add range"
       ranges={ranges}
@@ -51,7 +56,11 @@ export function SpendingRangesEditor({
         <SpendingAllocationsEditor
           allocations={range.allocations ?? []}
           onChange={(allocations) => updateRange({ allocations })}
-          spendingBucketDefs={spendingBucketDefs}
+          variables={variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          specialYears={specialYears}
+          deathYear={deathYear}
+          history={history}
         />
       )}
     />

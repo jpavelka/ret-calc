@@ -10,6 +10,33 @@ export const CURRENT_YEAR_SPECIAL_NAME = 'Current year'
 export const DEATH_YEAR_SPECIAL_ID = 'death-year'
 export const DEATH_YEAR_SPECIAL_NAME = 'Death year'
 
+// Every special year name available to insert into a formula/condition field
+// — stored special years plus the two built-in pseudo years — for an
+// "Insert…" dropdown's "Special years" group (see FormulaField/ConditionField).
+export function listSpecialYearNames(specialYears: SpecialYear[]): string[] {
+  return [...specialYears.map((s) => s.name), CURRENT_YEAR_SPECIAL_NAME, DEATH_YEAR_SPECIAL_NAME]
+}
+
+// The live-preview scope for a formula/condition field's "year" and special
+// year names, evaluated against today's calendar year — the same "preview
+// today's resolved value" convention every other live preview in this app
+// uses, rather than letting the preview scrub across years. "year" is set
+// last so it always wins even against a same-named special year (blocked
+// already by isReservedSpecialYearName, but kept consistent with
+// runProjection's own precedence regardless).
+export function specialYearPreviewScope(
+  specialYears: SpecialYear[],
+  deathYear: number | null,
+): Record<string, number> {
+  const currentYear = new Date().getFullYear()
+  const scope: Record<string, number> = {}
+  for (const s of specialYears) scope[s.name] = s.year
+  scope[CURRENT_YEAR_SPECIAL_NAME] = currentYear
+  scope[DEATH_YEAR_SPECIAL_NAME] = deathYear ?? currentYear
+  scope['year'] = currentYear
+  return scope
+}
+
 export function isReservedSpecialYearName(name: string): boolean {
   const normalized = name.trim().toLowerCase()
   return (

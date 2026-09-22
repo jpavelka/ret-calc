@@ -1,3 +1,4 @@
+import type { FormulaHistoryContext } from './formula'
 import { PlanRangesEditor } from './PlanRangesEditor'
 import { syncAllocationsToLineIds } from './prioritySetSync'
 import { RangePriorityEditor } from './RangePriorityEditor'
@@ -20,6 +21,7 @@ interface WithdrawalRangesEditorProps {
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
+  history?: FormulaHistoryContext
 }
 
 export function WithdrawalRangesEditor({
@@ -33,6 +35,7 @@ export function WithdrawalRangesEditor({
   specialYears,
   mode,
   bare = false,
+  history,
 }: WithdrawalRangesEditorProps) {
   return (
     <PlanRangesEditor
@@ -79,6 +82,9 @@ export function WithdrawalRangesEditor({
           allocations={range.allocations ?? []}
           onAllocationsChange={(allocations) => updateRange({ allocations })}
           spouseEnabled={spouseEnabled}
+          specialYears={specialYears}
+          deathYear={deathYear}
+          history={history}
         />
       )}
     />

@@ -1,8 +1,11 @@
 import { accountHasOwner, ACCOUNT_LABELS } from './accounts'
-import { CurrencyField } from './CurrencyField'
+import { AmountSourceEditor, AmountSourceFormulaRow } from './AmountSourceEditor'
+import type { FormulaHistoryContext } from './formula'
 import { HelpTooltip } from './HelpTooltip'
 import { calculateMatchAmount } from './match'
-import type { AccountType, IncomeSourceDef, MatchConfig, Owner, PriorityAllocation } from './types'
+import { resolveAllocation } from './projection'
+import { specialYearPreviewScope } from './specialYearGraph'
+import type { AccountType, MatchConfig, Owner, PriorityAllocation, SpecialYear, Variable } from './types'
 
 interface AllocationLineDef {
   id: string
@@ -30,7 +33,11 @@ interface RangePriorityEditorProps {
   allocations: PriorityAllocation[]
   onAllocationsChange: (allocations: PriorityAllocation[]) => void
   spouseEnabled: boolean
-  incomeSourceDefs?: IncomeSourceDef[]
+  variables?: Variable[]
+  resolvedVariableAmounts?: Map<string, number>
+  specialYears?: SpecialYear[]
+  deathYear?: number | null
+  history?: FormulaHistoryContext
 }
 
 export function RangePriorityEditor({
@@ -45,10 +52,16 @@ export function RangePriorityEditor({
   allocations,
   onAllocationsChange,
   spouseEnabled,
-  incomeSourceDefs = [],
+  variables = [],
+  resolvedVariableAmounts = new Map(),
+  specialYears = [],
+  deathYear = null,
+  history,
 }: RangePriorityEditorProps) {
-  function updateAmount(id: string, amount: number) {
-    onAllocationsChange(allocations.map((a) => (a.id === id ? { ...a, amount } : a)))
+  const variablesById = new Map(variables.map((v) => [v.id, v]))
+
+  function updateAllocation(id: string, patch: Partial<PriorityAllocation>) {
+    onAllocationsChange(allocations.map((a) => (a.id === id ? { ...a, ...patch } : a)))
   }
 
   return (
@@ -85,9 +98,17 @@ export function RangePriorityEditor({
           {allocations.map((allocation, index) => {
             const def = lineDefs.find((d) => d.id === allocation.lineId)
             const matchSource = def?.match
-              ? incomeSourceDefs.find((s) => s.id === def.match?.incomeSourceId)
+              ? variables.find((v) => v.id === def.match?.wageVariableId)
               : undefined
-            const salary = matchSource?.amount ?? 0
+            const salary = matchSource ? resolvedVariableAmounts.get(matchSource.id) ?? 0 : 0
+            const resolvedAmount =
+              resolveAllocation(
+                allocation,
+                variablesById,
+                resolvedVariableAmounts,
+                specialYearPreviewScope(specialYears, deathYear),
+                history,
+              )?.amount ?? 0
 
             return (
               <div key={allocation.id} className="rounded-md border border-slate-200 p-2">
@@ -102,24 +123,29 @@ export function RangePriorityEditor({
                         })`
                       : 'Unknown line'}
                   </span>
-                  <div className="w-32">
-                    <CurrencyField
-                      label="Amount"
-                      hideLabel
-                      min={0}
-                      value={allocation.amount}
-                      onChange={(v) => updateAmount(allocation.id, v)}
-                    />
-                  </div>
+                  <AmountSourceEditor
+                    source={allocation.source}
+                    onChange={(source) => updateAllocation(allocation.id, { source })}
+                    variables={variables}
+                    resolvedVariableAmounts={resolvedVariableAmounts}
+                    specialYears={specialYears}
+                    deathYear={deathYear}
+                    history={history}
+                  />
                 </div>
+                <AmountSourceFormulaRow
+                  source={allocation.source}
+                  onChange={(source) => updateAllocation(allocation.id, { source })}
+                  variables={variables}
+                  resolvedVariableAmounts={resolvedVariableAmounts}
+                  specialYears={specialYears}
+                  deathYear={deathYear}
+                  history={history}
+                />
                 {def?.match && (
                   <p className="mt-1 pl-6 text-xs text-slate-400">
                     Est. employer match: $
-                    {calculateMatchAmount(
-                      allocation.amount,
-                      salary,
-                      def.match.tiers,
-                    ).toLocaleString('en-US')}
+                    {calculateMatchAmount(resolvedAmount, salary, def.match.tiers).toLocaleString('en-US')}
                     {matchSource ? ` (against ${matchSource.name || 'Untitled'})` : ''}
                   </p>
                 )}

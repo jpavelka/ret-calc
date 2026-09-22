@@ -3,16 +3,20 @@ import { calculateMatchAmount } from './match'
 import { benefitScheduleForOwner, taxableSocialSecurityBenefit } from './socialSecurity'
 import { bracketBreakdown, computeIncomeTaxes, prepareTaxSchedules, scaleTaxSchedules } from './tax'
 import type { BracketBreakdownEntry } from './tax'
+import { tryEvaluateFormula, tryEvaluateCondition } from './formula'
+import type { FormulaHistoryContext } from './formula'
+import { CURRENT_YEAR_SPECIAL_NAME, DEATH_YEAR_SPECIAL_NAME } from './specialYearGraph'
+import { resolveVariableAmounts } from './variables'
 import type {
   AccountType,
-  IncomeAllocation,
-  IncomeSourceDef,
+  AmountSource,
+  Frequency,
+  GoalTarget,
   RetirementInputs,
   RmdDivisor,
   RothConversionPlanRange,
-  SavingsLineDef,
-  SpendingAllocation,
-  SpendingBucketDef,
+  SavingsLine,
+  Variable,
 } from './types'
 import {
   applyWithdrawalPlan,
@@ -33,6 +37,15 @@ export interface SavingsLineResult {
   name: string
   contribution: number
   match: number
+}
+
+// A savings line has no catalog id to identify it across ranges/years (see
+// SavingsPlanRange) — its name is the closest thing to a stable identity, so
+// it's what groups same-named lines together (within a year, and across
+// years in a UI's own aggregation). Falls back to the line's own id only for
+// a blank name, so two blank "Untitled" lines don't accidentally merge.
+export function savingsLineKey(line: SavingsLine): string {
+  return line.name.trim() || line.id
 }
 
 // This year's dollar change in an investment account, split into money that
@@ -140,10 +153,14 @@ export interface YearProjectionRow {
   }
 
   // Whatever came in this year — income plus any withdrawal, RMDs included —
-  // beyond what taxes/savings/spending used up, swept into the taxable
-  // brokerage account. Usually 0 whenever withdrawals.total is non-zero (the
-  // draw was sized to exactly cover the shortfall), except when a required
-  // minimum distribution forces more out than the year actually needed.
+  // beyond what taxes/savings/spending used up. Swept into the taxable
+  // brokerage account, unless an 'unlimited', goal-less savings line exists
+  // this year — the catch-all case — in which case it's redirected into that
+  // line's own account instead (see runProjection's savings pass) and also
+  // already reflected in savingsByLine/savingsEmployeeTotal above. Usually 0
+  // whenever withdrawals.total is non-zero (the draw was sized to exactly
+  // cover the shortfall), except when a required minimum distribution forces
+  // more out than the year actually needed.
   extraTaxableSavings: number
   // What the default withdrawal rule drew — a required minimum distribution
   // (mandatory regardless of need) plus, if that wasn't enough, whatever
@@ -245,51 +262,112 @@ function mapToNamed(map: Map<string, number>, namesById: Map<string, string>): N
 }
 
 interface ResolvedAllocation {
-  // A catalog-linked allocation is keyed by the def's id, so allocations
-  // across overlapping/multiple ranges referencing the same def aggregate
-  // together. A custom allocation has no def to share, so it's keyed by its
-  // own id and stands alone.
+  // A variable-linked allocation is keyed by the variable's id, so
+  // allocations across overlapping/multiple ranges referencing the same
+  // variable aggregate together. A custom allocation has no variable to
+  // share, so it's keyed by its own id and stands alone.
   key: string
   name: string
   amount: number
   inflationAdjusted: boolean
 }
 
-// A custom allocation carries its own name/amount/inflation flag. A
-// catalog-linked one has no stored amount of its own — it always reads the
-// def's current values directly, so there's nothing that can go stale.
-export function resolveIncomeAllocation(
-  alloc: IncomeAllocation,
-  defsById: Map<string, IncomeSourceDef>,
-): ResolvedAllocation | null {
-  if (alloc.custom) {
-    return {
-      key: alloc.id,
-      name: alloc.custom.name,
-      amount: alloc.custom.amount,
-      inflationAdjusted: alloc.custom.inflationAdjusted,
-    }
-  }
-  const def = alloc.sourceId ? defsById.get(alloc.sourceId) : undefined
-  if (!def) return null
-  return { key: def.id, name: def.name, amount: def.amount, inflationAdjusted: def.inflationAdjusted ?? true }
+export function annualizeAmount(amount: number, frequency: Frequency): number {
+  return frequency === 'monthly' ? amount * 12 : amount
 }
 
-function resolveSpendingAllocation(
-  alloc: SpendingAllocation,
-  defsById: Map<string, SpendingBucketDef>,
+// A custom line carries its own amount/inflation flag. A variable-linked one
+// has no stored amount of its own — it always reads the variable's (resolved)
+// current value directly, so there's nothing that can go stale — but still
+// carries its own inflation flag, same as 'custom'/'formula', since a
+// Variable isn't necessarily a dollar figure. A formula line evaluates its
+// expression against every variable's resolved value and carries its own
+// inflation flag, same reasoning. Either way the line's own name is used (lines are
+// named independently of any variable — `name` is optional since
+// PriorityAllocation, the withdrawal case, has none), and the amount is
+// annualized per the line's own chosen frequency.
+export function resolveAllocation(
+  alloc: { id: string; name?: string; source: AmountSource },
+  variablesById: Map<string, Variable>,
+  resolvedVariableAmounts: Map<string, number>,
+  // Extra names available to a formula source beyond the variable catalog —
+  // "year" and special years, keyed the same way runProjection's own
+  // yearScope builds them. Optional since not every caller has them (e.g. a
+  // UI preview that hasn't wired up special years).
+  extraScope: Record<string, number> = {},
+  // Prior-year inflation/return rate lookback for return_rate()/
+  // inflation_rate() in a formula source. Optional for the same reason as
+  // extraScope.
+  history?: FormulaHistoryContext,
 ): ResolvedAllocation | null {
-  if (alloc.custom) {
+  const name = alloc.name ?? ''
+  if (alloc.source.kind === 'custom') {
     return {
       key: alloc.id,
-      name: alloc.custom.name,
-      amount: alloc.custom.amount,
-      inflationAdjusted: alloc.custom.inflationAdjusted,
+      name,
+      amount: annualizeAmount(alloc.source.amount, alloc.source.frequency),
+      inflationAdjusted: alloc.source.inflationAdjusted,
     }
   }
-  const def = alloc.bucketId ? defsById.get(alloc.bucketId) : undefined
-  if (!def) return null
-  return { key: def.id, name: def.name, amount: def.amount, inflationAdjusted: def.inflationAdjusted ?? true }
+  if (alloc.source.kind === 'variable') {
+    const v = variablesById.get(alloc.source.variableId)
+    if (!v) return null
+    return {
+      key: v.id,
+      name,
+      amount: annualizeAmount(resolvedVariableAmounts.get(v.id) ?? 0, alloc.source.frequency),
+      inflationAdjusted: alloc.source.inflationAdjusted,
+    }
+  }
+  // 'unlimited' has no periodic amount to resolve — it's handled as a
+  // special case directly in runProjection's savings pass (the only place
+  // it's meaningful), not through this generic resolver. Callers elsewhere
+  // (income/spending/withdrawal, or a savings line's own match-estimate
+  // display) treat null the same as any other unresolvable amount.
+  if (alloc.source.kind === 'unlimited') return null
+  const scope: Record<string, number> = { ...extraScope }
+  for (const v of variablesById.values()) scope[v.name] = resolvedVariableAmounts.get(v.id) ?? 0
+  // "year" always wins even against a same-named Variable, same precedence
+  // as runProjection's own yearScope.
+  if (extraScope.year !== undefined) scope.year = extraScope.year
+  const result = tryEvaluateFormula(alloc.source.expression, scope, history)
+  if (!result.ok) return null
+  return {
+    key: alloc.id,
+    name,
+    amount: annualizeAmount(result.value, alloc.source.frequency),
+    inflationAdjusted: alloc.source.inflationAdjusted,
+  }
+}
+
+interface ResolvedGoal {
+  amount: number
+  inflationAdjusted: boolean
+}
+
+// A trimmed sibling of resolveAllocation for a GoalTarget — a point-in-time
+// balance, not a periodic amount, so there's no frequency/annualization step.
+function resolveGoal(
+  goal: GoalTarget,
+  variablesById: Map<string, Variable>,
+  resolvedVariableAmounts: Map<string, number>,
+  extraScope: Record<string, number> = {},
+  history?: FormulaHistoryContext,
+): ResolvedGoal | null {
+  if (goal.kind === 'custom') {
+    return { amount: goal.amount, inflationAdjusted: goal.inflationAdjusted }
+  }
+  if (goal.kind === 'variable') {
+    const v = variablesById.get(goal.variableId)
+    if (!v) return null
+    return { amount: resolvedVariableAmounts.get(v.id) ?? 0, inflationAdjusted: goal.inflationAdjusted }
+  }
+  const scope: Record<string, number> = { ...extraScope }
+  for (const v of variablesById.values()) scope[v.name] = resolvedVariableAmounts.get(v.id) ?? 0
+  if (extraScope.year !== undefined) scope.year = extraScope.year
+  const result = tryEvaluateFormula(goal.expression, scope, history)
+  if (!result.ok) return null
+  return { amount: result.value, inflationAdjusted: goal.inflationAdjusted }
 }
 
 // expectedReturnRatePct is documented (see the Investment return field) as a
@@ -364,28 +442,17 @@ type Balances = WithdrawalBalances
 const SOLVER_MAX_ITERATIONS = 100
 const SOLVER_TOLERANCE = 0.01
 
-// Medical spending this year that an HSA withdrawal could cover tax-free.
-// Nothing populates this yet — tracking qualified medical expenses is still
-// ahead of us, and will most likely arrive as a flag on SpendingBucketDef, at
-// which point only this function changes. Until then every HSA draw is
-// non-qualified.
-function qualifiedMedicalExpensesForYear(_inputs: RetirementInputs, _year: number): number {
-  return 0
-}
-
-// Education spending this year a 529 withdrawal could cover tax-free — the
-// sum of expenseByBucketMap's entries whose bucket def is flagged
-// educationRelated. Custom (non-catalog) allocations are keyed by their own
-// id in expenseByBucketMap, which never matches an entry in
-// spendingBucketDefsById, so they're naturally excluded — only catalog
-// buckets can be flagged as education-related today.
-function qualifiedEducationExpensesForYear(
+// Medical spending this year that an HSA withdrawal could cover tax-free, or
+// education spending a 529 withdrawal could cover tax-free — the sum of
+// expenseByBucketMap's entries whose originating spending line is flagged
+// medicalRelated / educationRelated, respectively.
+function qualifiedExpensesForYear(
   expenseByBucketMap: Map<string, number>,
-  spendingBucketDefsById: Map<string, SpendingBucketDef>,
+  expenseFlagByKey: Map<string, boolean>,
 ): number {
   let total = 0
   for (const [bucketId, amount] of expenseByBucketMap) {
-    if (spendingBucketDefsById.get(bucketId)?.educationRelated) total += amount
+    if (expenseFlagByKey.get(bucketId)) total += amount
   }
   return total
 }
@@ -395,19 +462,18 @@ function qualifiedEducationExpensesForYear(
 // entry, not just the 529 case.
 function contributionsForAccountType(
   account: AccountType,
-  contributionByLine: Map<string, number>,
-  savingsDefsById: Map<string, SavingsLineDef>,
+  contributionGroups: Map<string, { def: SavingsLine; amount: number }>,
 ): number {
   let total = 0
-  for (const [lineId, amount] of contributionByLine) {
-    if (savingsDefsById.get(lineId)?.account === account) total += amount
+  for (const group of contributionGroups.values()) {
+    if (group.def.account === account) total += group.amount
   }
   return total
 }
 
 // Which investment-account bucket a savings line's contributions land in —
 // null for cash, which isn't tracked as an investment account.
-function accountKeyFor(def: SavingsLineDef): InvestmentAccountKey | null {
+function accountKeyFor(def: SavingsLine): InvestmentAccountKey | null {
   switch (def.account) {
     case 'preTax':
       return def.owner === 'spouse' ? 'preTaxSpouse' : 'preTaxSelf'
@@ -426,10 +492,35 @@ function accountKeyFor(def: SavingsLineDef): InvestmentAccountKey | null {
   }
 }
 
+// Reads a savings line's current account balance for a goal check — like
+// accountKeyFor's mapping, but also covers 'cash' (which accountKeyFor
+// returns null for, since it isn't an InvestmentAccountKey). This is an
+// opening-of-year, pre-growth-for-this-year read (RMDs/HYSA interest already
+// applied, this year's growth/withdrawals not yet) — close enough for "has
+// this account reached $X" without needing a separate settlement pass.
+function currentBalanceFor(balances: Balances, def: SavingsLine): number {
+  switch (def.account) {
+    case 'preTax':
+      return balances[def.owner].preTax
+    case 'roth':
+      return balances[def.owner].roth
+    case 'taxable':
+      return balances.shared.taxable
+    case 'hsa':
+      return balances.shared.hsa
+    case 'college529':
+      return balances.shared.college529
+    case 'hysa':
+      return balances.shared.hysa
+    case 'cash':
+      return balances.shared.cash
+  }
+}
+
 function applyContribution(
   balances: Balances,
   contributionsByAccount: Record<InvestmentAccountKey, number>,
-  def: SavingsLineDef,
+  def: SavingsLine,
   contribution: number,
   match: number,
 ): void {
@@ -469,9 +560,11 @@ function applyContribution(
 // year through death year. Each year: total up active income and expense
 // allocations, fund the active savings plan (plus any employer match),
 // then either sweep what's left into the taxable brokerage account or, if
-// income fell short, cover the gap with the default withdrawal rule — cash,
-// then high-yield savings, then taxable, then pre-tax, then Roth, then HSA,
-// with the tax and penalties each draw triggers solved for by iteration.
+// income fell short, cover the gap with the default withdrawal rule —
+// medical-related spending from the HSA and education-related spending from
+// the 529, then cash, then high-yield savings, then taxable, then pre-tax,
+// then Roth, then whatever's left of the HSA and 529, with the tax and
+// penalties each draw triggers solved for by iteration.
 // Growth is applied to each account after that year's activity is posted.
 //
 // Required minimum distributions are modeled using the IRS Uniform Lifetime
@@ -494,9 +587,23 @@ export function runProjection(
   const finalYear = computeDeathYear(inputs.birthDate, inputs.lifeExpectancy)
   if (finalYear === null || finalYear < currentYear) return []
 
-  const incomeSourceDefsById = new Map(inputs.incomeSourceDefs.map((d) => [d.id, d]))
-  const spendingBucketDefsById = new Map(inputs.spendingBucketDefs.map((d) => [d.id, d]))
-  const savingsDefsById = new Map(inputs.savingsLineDefs.map((d) => [d.id, d]))
+  const variablesById = new Map(inputs.variables.map((v) => [v.id, v]))
+  const resolvedVariableAmounts = resolveVariableAmounts(inputs.variables).amounts
+
+  // Special years, by name, for condition and amount/goal formulas (e.g.
+  // "year < [College]"). inputs.specialYears is trusted to already carry
+  // each entry's resolved absolute year — the same assumption
+  // resolveSpecialYearRef's callers
+  // (YearBoundaryField, SpecialYearsEditor) make, kept true by
+  // resolveInputsSpecialYears running on load and on every special-year/
+  // birth-date/life-expectancy edit. The two built-in pseudo years aren't
+  // stored in inputs.specialYears, so they're added separately; a user can't
+  // name their own special year "Current year"/"Death year" (see
+  // isReservedSpecialYearName), so there's no collision to arbitrate here.
+  const specialYearScope: Record<string, number> = {}
+  for (const sy of inputs.specialYears) specialYearScope[sy.name] = sy.year
+  specialYearScope[CURRENT_YEAR_SPECIAL_NAME] = currentYear
+  specialYearScope[DEATH_YEAR_SPECIAL_NAME] = finalYear
 
   // Sorted once here rather than per bracketTax call: the solver re-runs the
   // tax calculation several times a year across every year of the projection,
@@ -538,11 +645,28 @@ export function runProjection(
   // dollars") and is carried forward at the end of each iteration below.
   let inflationFactor = 1
 
+  // Realized rates so far, most-recent-first (index 0 = the year currently
+  // being evaluated, index 1 = one year before it, ...) — read by
+  // return_rate()/inflation_rate() in a formula via historyContext below.
+  // Unshifted onto at the top of each iteration, before that year's formulas
+  // run, so "this year" is always available at index 0.
+  const returnRateHistory: number[] = []
+  const inflationRateHistory: number[] = []
+
   for (let year = currentYear; year <= finalYear; year++) {
     const yearRates = rateOverridesByYear?.[year - currentYear]
     const yearReturnRatePct = yearRates?.realReturnRatePct ?? inputs.expectedReturnRatePct
     const yearInflationRatePct = yearRates?.inflationRatePct ?? inputs.inflationRatePct
     const growthRate = nominalGrowthRate(yearReturnRatePct, yearInflationRatePct)
+    returnRateHistory.unshift(yearReturnRatePct)
+    inflationRateHistory.unshift(yearInflationRatePct)
+    // Years further back than history exists yet (e.g. return_rate(5) in
+    // year 2 of the projection) fall back to the flat scenario assumption,
+    // rather than erroring, so a lookback formula doesn't misfire early on.
+    const historyContext: FormulaHistoryContext = {
+      returnRate: (n) => returnRateHistory[n] ?? inputs.expectedReturnRatePct,
+      inflationRate: (n) => inflationRateHistory[n] ?? inputs.inflationRatePct,
+    }
     const taxSchedules = scaleTaxSchedules(baseTaxSchedules, inflationFactor, inputs)
 
     // --- High-yield savings interest ---
@@ -567,12 +691,21 @@ export function runProjection(
     const rmdSelf = requiredMinimumDistribution(inputs, balances.self.preTax, selfAge)
     const rmdSpouse = requiredMinimumDistribution(inputs, balances.spouse.preTax, spouseAgeForRmd)
 
+    // The scope every formula/condition this year evaluates against, beyond
+    // its own variable catalog — layered lowest to highest precedence:
+    // special years, then variables (a variable can shadow a same-named
+    // special year), then "year" itself last, so it always wins even against
+    // a same-named Variable.
+    const yearScope: Record<string, number> = { ...specialYearScope }
+    for (const v of variablesById.values()) yearScope[v.name] = resolvedVariableAmounts.get(v.id) ?? 0
+    yearScope['year'] = year
+
     // --- Income ---
     const incomeBySourceMap = new Map<string, number>()
     const incomeNameByKey = new Map<string, string>()
     for (const range of activeRanges(inputs.incomeRanges, year)) {
       for (const alloc of range.allocations) {
-        const resolved = resolveIncomeAllocation(alloc, incomeSourceDefsById)
+        const resolved = resolveAllocation(alloc, variablesById, resolvedVariableAmounts, yearScope, historyContext)
         if (!resolved) continue
         const grown = resolved.inflationAdjusted ? resolved.amount * inflationFactor : resolved.amount
         incomeBySourceMap.set(resolved.key, (incomeBySourceMap.get(resolved.key) ?? 0) + grown)
@@ -584,31 +717,62 @@ export function runProjection(
     // --- Expenses ---
     const expenseByBucketMap = new Map<string, number>()
     const expenseNameByKey = new Map<string, string>()
+    const expenseEducationByKey = new Map<string, boolean>()
+    const expenseMedicalByKey = new Map<string, boolean>()
     for (const range of activeRanges(inputs.spendingRanges, year)) {
       for (const alloc of range.allocations) {
-        const resolved = resolveSpendingAllocation(alloc, spendingBucketDefsById)
+        const resolved = resolveAllocation(alloc, variablesById, resolvedVariableAmounts, yearScope, historyContext)
         if (!resolved) continue
         const grown = resolved.inflationAdjusted ? resolved.amount * inflationFactor : resolved.amount
         expenseByBucketMap.set(resolved.key, (expenseByBucketMap.get(resolved.key) ?? 0) + grown)
         expenseNameByKey.set(resolved.key, resolved.name)
+        expenseEducationByKey.set(
+          resolved.key,
+          (expenseEducationByKey.get(resolved.key) ?? false) || (alloc.educationRelated ?? false),
+        )
+        expenseMedicalByKey.set(
+          resolved.key,
+          (expenseMedicalByKey.get(resolved.key) ?? false) || (alloc.medicalRelated ?? false),
+        )
       }
     }
     const expenseTotal = sumValues(expenseByBucketMap)
 
-    // --- Savings plan (line amounts have no inflation flag, so held flat) ---
-    const contributionByLine = new Map<string, number>()
-    for (const range of activeRanges(inputs.savingsRanges, year)) {
-      for (const alloc of range.allocations) {
-        if (!alloc.lineId || !savingsDefsById.has(alloc.lineId)) continue
-        contributionByLine.set(alloc.lineId, (contributionByLine.get(alloc.lineId) ?? 0) + alloc.amount)
-      }
-    }
-
+    // --- Savings plan ---
+    // Lines are defined directly on each range (no shared catalog), so
+    // there's no stable id to group same-account lines by across ranges the
+    // way a Variable's id does for income/spending. Grouping by name instead
+    // (see savingsLineKey) keeps tiered employer match correct when
+    // overlapping ranges both fund a same-named line, and gives that line a
+    // single, stable result entry — same reasoning as resolveAllocation's
+    // 'variable' case. If overlapping ranges give a same-named line
+    // different account/owner/match, whichever is encountered first that
+    // year wins as the representative def; amounts still sum.
+    //
+    // Each active range is processed as one ordered pass over its own
+    // `lines`, rather than building every range's contributions into a map
+    // first and applying them in a second phase: a goal-capped line needs to
+    // see the live account balance left by the lines before it *in the same
+    // range this same year* (so balances are mutated immediately, per line),
+    // and any amount a goal-capped line doesn't need cascades as `overflow`
+    // to fund the next line in that same range's list — the "layered,
+    // first-line-funded-first" ordering SavingsPlanRange's own doc comment
+    // already describes. `overflow` is reset per range: it never crosses
+    // from one range into another's lines.
+    const contributionGroups = new Map<string, { def: SavingsLine; amount: number }>()
+    const savingsByLineMap = new Map<string, SavingsLineResult>()
     let savingsEmployeeTotal = 0
     let savingsEmployerMatchTotal = 0
     let preTaxDeferrals = 0
     let hsaContributions = 0
-    const savingsByLine: SavingsLineResult[] = []
+    // The first 'unlimited' line (in range/line order) with no goal to aim
+    // at — i.e. nothing bounds it. Rather than being a no-op, such a line
+    // becomes this year's catch-all: whatever's left over after taxes,
+    // expenses, and every other savings line (computed below as
+    // extraTaxableSavings) is redirected into its account instead of the
+    // default taxable sweep. Only the first one found is used — same
+    // "first line wins" precedent as the same-name-merge comment above.
+    let catchAllLine: SavingsLine | null = null
     const contributionsByAccount: Record<InvestmentAccountKey, number> = {
       preTaxSelf: 0,
       preTaxSpouse: 0,
@@ -620,31 +784,109 @@ export function runProjection(
       college529: 0,
     }
 
-    for (const [lineId, contribution] of contributionByLine) {
-      const def = savingsDefsById.get(lineId)
-      if (!def) continue
-      const match = def.match?.incomeSourceId
-        ? calculateMatchAmount(
-            contribution,
-            incomeBySourceMap.get(def.match.incomeSourceId) ?? 0,
-            def.match.tiers,
-          )
-        : 0
+    for (const range of activeRanges(inputs.savingsRanges, year)) {
+      let overflow = 0
 
-      savingsEmployeeTotal += contribution
-      savingsEmployerMatchTotal += match
-      if (def.account === 'preTax') preTaxDeferrals += contribution
-      if (def.account === 'hsa') hsaContributions += contribution
+      for (const line of range.lines) {
+        if (line.condition) {
+          const result = tryEvaluateCondition(line.condition, yearScope, historyContext)
+          // A condition that fails to evaluate (e.g. mid-edit typo) fails
+          // OPEN — treated as if no condition were set — since a savings
+          // line silently vanishing from the whole projection over a formula
+          // error is a worse failure mode than it silently always applying;
+          // the condition editor surfaces the parse error directly.
+          if (result.ok && !result.value) continue
+        }
 
-      applyContribution(balances, contributionsByAccount, def, contribution, match)
-      savingsByLine.push({ id: lineId, name: def.name, contribution, match })
+        // 'unlimited' has no periodic amount to resolve — it never
+        // contributes anything of its own (grown stays 0); its whole point
+        // is the goal-cap branch below, which for this kind ignores
+        // `requested` and always tops up to the goal directly instead of
+        // being bounded by it.
+        const isUnlimited = line.source.kind === 'unlimited'
+        let grown = 0
+        if (!isUnlimited) {
+          const resolved = resolveAllocation(line, variablesById, resolvedVariableAmounts, yearScope, historyContext)
+          if (!resolved) continue
+          grown = resolved.inflationAdjusted ? resolved.amount * inflationFactor : resolved.amount
+        }
+
+        const requested = grown + overflow
+        overflow = 0
+        let toContribute = requested
+        let goalApplied = false
+
+        if (line.goal) {
+          const resolvedGoal = resolveGoal(line.goal, variablesById, resolvedVariableAmounts, yearScope, historyContext)
+          // A dangling goal reference (e.g. deleted variable) fails open too:
+          // uncapped this year, same reasoning as the condition case above —
+          // for 'unlimited' this leaves toContribute at `requested` and
+          // goalApplied false, the same "nothing to aim at" state as having
+          // no goal at all (see catchAllLine below).
+          if (resolvedGoal) {
+            goalApplied = true
+            const target = resolvedGoal.inflationAdjusted
+              ? resolvedGoal.amount * inflationFactor
+              : resolvedGoal.amount
+            const room = Math.max(0, target - currentBalanceFor(balances, line))
+            if (isUnlimited) {
+              // Not bounded by `requested` (there is none, by design) — draws
+              // whatever it takes, beyond incoming overflow if it has to, to
+              // land exactly on the goal. Same "not capped by funds on hand"
+              // caveat as every other savings line.
+              toContribute = room
+              if (requested > room) overflow += requested - room
+            } else if (requested > room) {
+              overflow += requested - room
+              toContribute = room
+            }
+          }
+        }
+
+        if (isUnlimited && !goalApplied && !catchAllLine) catchAllLine = line
+
+        const match = line.match?.wageVariableId
+          ? calculateMatchAmount(
+              toContribute,
+              incomeBySourceMap.get(line.match.wageVariableId) ?? 0,
+              line.match.tiers,
+            )
+          : 0
+
+        savingsEmployeeTotal += toContribute
+        savingsEmployerMatchTotal += match
+        if (line.account === 'preTax') preTaxDeferrals += toContribute
+        if (line.account === 'hsa') hsaContributions += toContribute
+
+        applyContribution(balances, contributionsByAccount, line, toContribute, match)
+
+        const key = savingsLineKey(line)
+        const existingGroup = contributionGroups.get(key)
+        if (existingGroup) {
+          existingGroup.amount += toContribute
+        } else {
+          contributionGroups.set(key, { def: line, amount: toContribute })
+        }
+
+        const existingRow = savingsByLineMap.get(key)
+        if (existingRow) {
+          existingRow.contribution += toContribute
+          existingRow.match += match
+        } else {
+          savingsByLineMap.set(key, { id: key, name: line.name, contribution: toContribute, match })
+        }
+      }
+      // Any overflow left once this range's lines run out simply isn't
+      // contributed — no cross-range spillover.
     }
+    // savingsByLine is flattened from savingsByLineMap further below, after
+    // extraTaxableSavings may add one more contribution to catchAllLine.
 
     // --- State contribution-based deductions (e.g. Kansas's 529 deduction) ---
     // Non-carryforward: each year's deduction is capped independently against
     // that year's own contributions, with no banking of unused amounts.
     const stateContributionDeductionAmount = inputs.stateContributionDeductions.reduce((total, d) => {
-      const contributed = contributionsForAccountType(d.account, contributionByLine, savingsDefsById)
+      const contributed = contributionsForAccountType(d.account, contributionGroups)
       const cap = Math.max(0, d.perBeneficiaryCap) * Math.max(0, d.beneficiaryCount)
       return total + Math.min(Math.max(0, contributed), cap)
     }, 0)
@@ -721,8 +963,8 @@ export function runProjection(
       selfPenaltyFree: hasReachedAgeDuringYear(inputs.birthDate, 59.5, year),
       spousePenaltyFree: hasReachedAgeDuringYear(spousePenaltyBirthDate, 59.5, year),
       hsaPenaltyFree: hasReachedAgeDuringYear(inputs.birthDate, 65, year),
-      qualifiedMedicalExpenses: qualifiedMedicalExpensesForYear(inputs, year),
-      qualifiedEducationExpenses: qualifiedEducationExpensesForYear(expenseByBucketMap, spendingBucketDefsById),
+      qualifiedMedicalExpenses: qualifiedExpensesForYear(expenseByBucketMap, expenseMedicalByKey),
+      qualifiedEducationExpenses: qualifiedExpensesForYear(expenseByBucketMap, expenseEducationByKey),
       rmdSelf,
       rmdSpouse,
     }
@@ -818,9 +1060,36 @@ export function runProjection(
       incomeTotal + ssBenefitTotal + plan.total - totalTax - savingsEmployeeTotal - expenseTotal,
     )
     applyWithdrawalPlan(balances, plan)
-    balances.shared.taxable += extraTaxableSavings
-    balances.shared.taxableBasis += extraTaxableSavings
-    contributionsByAccount.taxable += extraTaxableSavings
+    if (catchAllLine) {
+      // Redirect the leftover into the catch-all line's own account instead
+      // of the default taxable sweep — "contribute everything remaining."
+      // No employer match on this portion (a leftover sweep isn't a real
+      // payroll contribution). Not folded back into this year's tax
+      // calculation even when the account is preTax/hsa (those would
+      // otherwise reduce taxable income) — recomputing taxes off an amount
+      // that itself depends on the tax result would be circular; same
+      // "good enough, not exact" tradeoff as the engine's other simplifications.
+      applyContribution(balances, contributionsByAccount, catchAllLine, extraTaxableSavings, 0)
+      savingsEmployeeTotal += extraTaxableSavings
+      const key = savingsLineKey(catchAllLine)
+      const existingGroup = contributionGroups.get(key)
+      if (existingGroup) {
+        existingGroup.amount += extraTaxableSavings
+      } else {
+        contributionGroups.set(key, { def: catchAllLine, amount: extraTaxableSavings })
+      }
+      const existingRow = savingsByLineMap.get(key)
+      if (existingRow) {
+        existingRow.contribution += extraTaxableSavings
+      } else {
+        savingsByLineMap.set(key, { id: key, name: catchAllLine.name, contribution: extraTaxableSavings, match: 0 })
+      }
+    } else {
+      balances.shared.taxable += extraTaxableSavings
+      balances.shared.taxableBasis += extraTaxableSavings
+      contributionsByAccount.taxable += extraTaxableSavings
+    }
+    const savingsByLine = [...savingsByLineMap.values()]
 
     // --- Growth: this year's contributions grow for the full year, and
     // withdrawals forgo a full year's growth (grow-then-sit-flat isn't

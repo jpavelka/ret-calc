@@ -1,23 +1,34 @@
+import { useMemo } from 'react'
 import { birthYear, calculateAge, deathYear } from './age'
 import { AwiTableEditor } from './AwiTableEditor'
 import {
-  pruneDanglingIncomeAllocations,
-  pruneDanglingMatchSources,
-  pruneDanglingSpendingAllocations,
+  convertDanglingIncomeVariableRefs,
+  convertDanglingSavingsRangeVariableRefs,
+  convertDanglingSpendingVariableRefs,
+  convertDanglingWithdrawalRangeVariableRefs,
+  freezeFormulaRefsInRanges,
+  freezeFormulaRefsInSavingsRanges,
+  freezeFormulaRefsInVariables,
+  freezeSpecialYearRefsInSavingsRanges,
+  pruneDanglingMatchSourcesInSavingsRanges,
+  renameFormulaRefsInRanges,
+  renameFormulaRefsInSavingsRanges,
+  renameFormulaRefsInVariables,
+  renameSpecialYearRefsInSavingsRanges,
 } from './catalogSync'
 import { CheckboxField } from './CheckboxField'
 import { CollapsibleSection } from './CollapsibleSection'
 import { CurrencyField } from './CurrencyField'
 import { DateField } from './DateField'
+import { flatRateHistoryContext } from './formula'
 import { FraTableEditor } from './FraTableEditor'
 import { HelpTooltip } from './HelpTooltip'
 import { IncomeRangesEditor } from './IncomeRangesEditor'
-import { NamedAmountCatalogEditor } from './NamedAmountCatalogEditor'
 import { NumberField } from './NumberField'
 import { pruneDanglingLineIds, syncRangesToPrioritySets } from './prioritySetSync'
+import { resolveVariableAmounts } from './variables'
 import { RmdDivisorsEditor } from './RmdDivisorsEditor'
 import { RothConversionRangesEditor } from './RothConversionRangesEditor'
-import { SavingsPrioritiesEditor } from './SavingsPrioritiesEditor'
 import { SavingsRangesEditor } from './SavingsRangesEditor'
 import { resolveInputsSpecialYears } from './specialYearsSync'
 import { computeOwnerBenefitSummary, type SocialSecurityBenefitSummary } from './socialSecurity'
@@ -27,18 +38,16 @@ import { SpecialYearsEditor } from './SpecialYearsEditor'
 import { SpendingRangesEditor } from './SpendingRangesEditor'
 import { StateContributionDeductionsEditor } from './StateContributionDeductionsEditor'
 import { TaxBracketsEditor } from './TaxBracketsEditor'
+import { VariablesEditor } from './VariablesEditor'
 import type {
-  IncomeSourceDef,
   Owner,
   OwnedAccountBalances,
   RetirementInputs,
-  SavingsLineDef,
-  SavingsPrioritySet,
   SharedAccountBalances,
   SocialSecurityBenefitMethod,
   SocialSecurityOwnerConfig,
   SpecialYear,
-  SpendingBucketDef,
+  Variable,
   WithdrawalLineDef,
   WithdrawalPrioritySet,
 } from './types'
@@ -230,7 +239,7 @@ function SocialSecurityOwnerFields({
   label,
   config,
   onChange,
-  incomeSourceDefs,
+  variables,
   benefitSummary,
   inputs,
   owner,
@@ -238,7 +247,7 @@ function SocialSecurityOwnerFields({
   label: string
   config: SocialSecurityOwnerConfig
   onChange: (config: SocialSecurityOwnerConfig) => void
-  incomeSourceDefs: IncomeSourceDef[]
+  variables: Variable[]
   benefitSummary: SocialSecurityBenefitSummary | null
   inputs: RetirementInputs
   owner: Owner
@@ -321,25 +330,25 @@ function SocialSecurityOwnerFields({
           <div>
             <h4 className="flex items-center gap-1 text-xs font-semibold text-slate-500">
               Future wages
-              <HelpTooltip text="Which income sources count toward this person's Social Security record for years not entered above (today through claiming age) — those sources' projected amounts, capped at the wage base, fill in the missing years automatically." />
+              <HelpTooltip text="Which variables count toward this person's Social Security record for years not entered above (today through claiming age) — those variables' projected income-allocation amounts, capped at the wage base, fill in the missing years automatically." />
             </h4>
             <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1">
-              {incomeSourceDefs.length === 0 && (
+              {variables.length === 0 && (
                 <p className="text-sm text-slate-400">
-                  No income sources defined yet — add one under Income above.
+                  No variables defined yet — add one under Variables above.
                 </p>
               )}
-              {incomeSourceDefs.map((def) => (
+              {variables.map((v) => (
                 <CheckboxField
-                  key={def.id}
-                  label={def.name || 'Untitled'}
-                  checked={config.wageSourceIds.includes(def.id)}
+                  key={v.id}
+                  label={v.name || 'Untitled'}
+                  checked={config.wageVariableIds.includes(v.id)}
                   onChange={(checked) =>
                     onChange({
                       ...config,
-                      wageSourceIds: checked
-                        ? [...config.wageSourceIds, def.id]
-                        : config.wageSourceIds.filter((id) => id !== def.id),
+                      wageVariableIds: checked
+                        ? [...config.wageVariableIds, v.id]
+                        : config.wageVariableIds.filter((id) => id !== v.id),
                     })
                   }
                 />
@@ -369,9 +378,33 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
   const spouseAge = inputs.spouseEnabled ? calculateAge(inputs.spouseBirthDate) : null
   const deathYr = deathYear(inputs.birthDate, inputs.lifeExpectancy)
   const [yearMode, setYearMode] = useYearDisplayMode()
+  const resolvedVariables = useMemo(() => resolveVariableAmounts(inputs.variables), [inputs.variables])
+  const resolvedVariableAmounts = resolvedVariables.amounts
+  // return_rate()/inflation_rate() in every live formula/condition preview
+  // below fall back to this flat scenario assumption — none of these editors
+  // run inside a real per-year projection loop, so there's no actual history
+  // to look back through (see runProjection's own historyContext for that).
+  const formulaHistory = useMemo(
+    () => flatRateHistoryContext(inputs.expectedReturnRatePct, inputs.inflationRatePct),
+    [inputs.expectedReturnRatePct, inputs.inflationRatePct],
+  )
 
   function handleSpecialYearsChange(specialYears: SpecialYear[]) {
-    onChange(resolveInputsSpecialYears({ ...inputs, specialYears }))
+    // A savings line's condition can reference a special year by name (e.g.
+    // "year < [College]") — same text-level rename/freeze cascade as a
+    // Variable rename/delete (handleVariablesChange below), since nothing
+    // else here currently references special years by name.
+    let savingsRanges = inputs.savingsRanges
+    for (const oldSpecialYear of inputs.specialYears) {
+      const stillPresent = specialYears.find((s) => s.id === oldSpecialYear.id)
+      if (stillPresent) {
+        if (stillPresent.name === oldSpecialYear.name) continue
+        savingsRanges = renameSpecialYearRefsInSavingsRanges(savingsRanges, oldSpecialYear.name, stillPresent.name)
+      } else {
+        savingsRanges = freezeSpecialYearRefsInSavingsRanges(savingsRanges, oldSpecialYear.name, oldSpecialYear.year)
+      }
+    }
+    onChange(resolveInputsSpecialYears({ ...inputs, specialYears, savingsRanges }))
   }
 
   function handleBirthDateChange(birthDate: string) {
@@ -382,37 +415,66 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
     onChange(resolveInputsSpecialYears({ ...inputs, lifeExpectancy }))
   }
 
-  function handleIncomeSourceDefsChange(incomeSourceDefs: IncomeSourceDef[]) {
-    const savingsLineDefs = pruneDanglingMatchSources(inputs.savingsLineDefs, incomeSourceDefs)
-    onChange({
-      ...inputs,
-      incomeSourceDefs,
-      savingsLineDefs,
-      incomeRanges: pruneDanglingIncomeAllocations(inputs.incomeRanges, incomeSourceDefs),
-    })
-  }
+  function handleVariablesChange(variables: Variable[]) {
+    const validIds = new Set(variables.map((v) => v.id))
+    // Freeze/rename against the OLD variables (before this change) and their
+    // OLD resolved amounts, so a deleted variable's last known amount
+    // survives on any line/variable that referenced it, and a renamed
+    // variable's formulas keep resolving.
+    const oldVariablesById = new Map(inputs.variables.map((v) => [v.id, v]))
+    const oldResolvedAmounts = resolvedVariableAmounts
 
-  function handleSpendingBucketDefsChange(spendingBucketDefs: SpendingBucketDef[]) {
-    onChange({
-      ...inputs,
-      spendingBucketDefs,
-      spendingRanges: pruneDanglingSpendingAllocations(inputs.spendingRanges, spendingBucketDefs),
-    })
-  }
+    let incomeRanges = convertDanglingIncomeVariableRefs(inputs.incomeRanges, validIds, oldVariablesById, oldResolvedAmounts)
+    let spendingRanges = convertDanglingSpendingVariableRefs(inputs.spendingRanges, validIds, oldVariablesById, oldResolvedAmounts)
+    let savingsRanges = pruneDanglingMatchSourcesInSavingsRanges(
+      convertDanglingSavingsRangeVariableRefs(inputs.savingsRanges, validIds, oldVariablesById, oldResolvedAmounts),
+      variables,
+    )
+    let withdrawalRanges = convertDanglingWithdrawalRangeVariableRefs(inputs.withdrawalRanges, validIds, oldVariablesById, oldResolvedAmounts)
+    let nextVariables = variables
 
-  function handleSavingsLineDefsChange(savingsLineDefs: SavingsLineDef[]) {
-    const validIds = new Set(savingsLineDefs.map((d) => d.id))
-    const savingsPrioritySets = pruneDanglingLineIds(inputs.savingsPrioritySets, validIds)
-    const defaultAmounts = new Map(savingsLineDefs.map((d) => [d.id, d.amount]))
+    // A 'variable'-kind source links by id (handled above, immune to
+    // renames). A formula's expression references a variable BY NAME, so it
+    // needs its own text-level rename/freeze cascade.
+    for (const oldVar of inputs.variables) {
+      const stillPresent = variables.find((v) => v.id === oldVar.id)
+      if (stillPresent) {
+        if (stillPresent.name === oldVar.name) continue
+        const oldName = oldVar.name
+        const newName = stillPresent.name
+        incomeRanges = renameFormulaRefsInRanges(incomeRanges, oldName, newName)
+        spendingRanges = renameFormulaRefsInRanges(spendingRanges, oldName, newName)
+        savingsRanges = renameFormulaRefsInSavingsRanges(savingsRanges, oldName, newName)
+        withdrawalRanges = renameFormulaRefsInRanges(withdrawalRanges, oldName, newName)
+        nextVariables = renameFormulaRefsInVariables(nextVariables, oldName, newName)
+      } else {
+        const value = oldResolvedAmounts.get(oldVar.id) ?? 0
+        incomeRanges = freezeFormulaRefsInRanges(incomeRanges, oldVar.name, value)
+        spendingRanges = freezeFormulaRefsInRanges(spendingRanges, oldVar.name, value)
+        savingsRanges = freezeFormulaRefsInSavingsRanges(savingsRanges, oldVar.name, value)
+        withdrawalRanges = freezeFormulaRefsInRanges(withdrawalRanges, oldVar.name, value)
+        nextVariables = freezeFormulaRefsInVariables(nextVariables, oldVar.name, value)
+      }
+    }
+
     onChange({
       ...inputs,
-      savingsLineDefs,
-      savingsPrioritySets,
-      savingsRanges: syncRangesToPrioritySets(
-        inputs.savingsRanges,
-        savingsPrioritySets,
-        defaultAmounts,
-      ),
+      variables: nextVariables,
+      incomeRanges,
+      spendingRanges,
+      savingsRanges,
+      withdrawalRanges,
+      socialSecurity: {
+        ...inputs.socialSecurity,
+        self: {
+          ...inputs.socialSecurity.self,
+          wageVariableIds: inputs.socialSecurity.self.wageVariableIds.filter((id) => validIds.has(id)),
+        },
+        spouse: {
+          ...inputs.socialSecurity.spouse,
+          wageVariableIds: inputs.socialSecurity.spouse.wageVariableIds.filter((id) => validIds.has(id)),
+        },
+      },
     })
   }
 
@@ -429,19 +491,6 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       withdrawalRanges: syncRangesToPrioritySets(
         inputs.withdrawalRanges,
         withdrawalPrioritySets,
-      ),
-    })
-  }
-
-  function handleSavingsPrioritySetsChange(savingsPrioritySets: SavingsPrioritySet[]) {
-    const defaultAmounts = new Map(inputs.savingsLineDefs.map((d) => [d.id, d.amount]))
-    onChange({
-      ...inputs,
-      savingsPrioritySets,
-      savingsRanges: syncRangesToPrioritySets(
-        inputs.savingsRanges,
-        savingsPrioritySets,
-        defaultAmounts,
       ),
     })
   }
@@ -534,6 +583,192 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           />
         )}
       </Section>
+
+      <CollapsibleSection title="Current account balances">
+        {inputs.spouseEnabled ? (
+          <div className="flex flex-col gap-5">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-600">You</h3>
+              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <OwnedBalanceFields
+                  balances={inputs.balances.self}
+                  onChange={(b) =>
+                    onChange({ ...inputs, balances: { ...inputs.balances, self: b } })
+                  }
+                />
+              </div>
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-slate-600">Spouse</h3>
+              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <OwnedBalanceFields
+                  balances={inputs.balances.spouse}
+                  onChange={(b) =>
+                    onChange({ ...inputs, balances: { ...inputs.balances, spouse: b } })
+                  }
+                />
+              </div>
+            </div>
+            <div>
+              <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
+                Shared
+                <HelpTooltip text="Taxable brokerage, HSA, cash, and high-yield savings are tracked as combined household accounts rather than split between spouses." />
+              </h3>
+              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <SharedBalanceFields
+                  balances={inputs.balances.shared}
+                  onChange={(b) =>
+                    onChange({ ...inputs, balances: { ...inputs.balances, shared: b } })
+                  }
+                />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <OwnedBalanceFields
+              balances={inputs.balances.self}
+              onChange={(b) =>
+                onChange({ ...inputs, balances: { ...inputs.balances, self: b } })
+              }
+            />
+            <SharedBalanceFields
+              balances={inputs.balances.shared}
+              onChange={(b) =>
+                onChange({ ...inputs, balances: { ...inputs.balances, shared: b } })
+              }
+            />
+          </div>
+        )}
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title={
+          <>
+            Variables
+            <HelpTooltip text="Named dollar amounts you can reuse across income, spending, and savings lines below — e.g. a variable 'Regular spending' that a spending line references as a yearly or monthly figure. Amounts are always entered in today's dollars." />
+          </>
+        }
+      >
+        <VariablesEditor
+          bare
+          variables={inputs.variables}
+          onChange={handleVariablesChange}
+          resolvedVariables={resolvedVariables}
+          history={formulaHistory}
+        />
+      </CollapsibleSection>
+
+      <SpecialYearsEditor
+        specialYears={inputs.specialYears}
+        onChange={handleSpecialYearsChange}
+        birthYear={birthYear(inputs.birthDate)}
+        deathYear={deathYr}
+        mode={yearMode}
+        onModeChange={setYearMode}
+      />
+
+      <CollapsibleSection
+        title={
+          <>
+            Income
+            <HelpTooltip text="Name each line of income you might have, e.g. a job's wages, sourced from a variable or a custom one-off amount. Then build an income plan of year ranges below." />
+          </>
+        }
+      >
+        <IncomeRangesEditor
+          bare
+          ranges={inputs.incomeRanges}
+          onChange={(ranges) => onChange({ ...inputs, incomeRanges: ranges })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          birthYear={birthYear(inputs.birthDate)}
+          deathYear={deathYr}
+          specialYears={inputs.specialYears}
+          mode={yearMode}
+          history={formulaHistory}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title={
+          <>
+            Spending
+            <HelpTooltip text="Name each line of spending, e.g. Groceries or Travel, sourced from a variable or a custom one-off amount. Then build a spending plan of year ranges below." />
+          </>
+        }
+      >
+        <SpendingRangesEditor
+          bare
+          ranges={inputs.spendingRanges}
+          onChange={(ranges) => onChange({ ...inputs, spendingRanges: ranges })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          birthYear={birthYear(inputs.birthDate)}
+          deathYear={deathYr}
+          specialYears={inputs.specialYears}
+          mode={yearMode}
+          history={formulaHistory}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title={
+          <>
+            Savings
+            <HelpTooltip text="Add a year range, then build its savings plan directly inside it: layered lines (401k, Roth IRA, taxable, ...) in the order they're funded, each with an account, an amount, and an optional employer match." />
+          </>
+        }
+      >
+        <SavingsRangesEditor
+          bare
+          ranges={inputs.savingsRanges}
+          onChange={(ranges) => onChange({ ...inputs, savingsRanges: ranges })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          spouseEnabled={inputs.spouseEnabled}
+          birthYear={birthYear(inputs.birthDate)}
+          deathYear={deathYr}
+          specialYears={inputs.specialYears}
+          mode={yearMode}
+          history={formulaHistory}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title={
+          <>
+            Withdrawals
+            <HelpTooltip text="Define the accounts you might withdraw from, group them into named priorities, then build a withdrawal plan of year ranges below, each referencing a priority with an amount for each of its lines. Note: the projection does not use these yet — it covers any shortfall in a fixed order (that year's medical-related spending from the HSA and education-related spending from the 529, then cash, then high-yield savings, then taxable, then pre-tax, then Roth, then whatever's left of the HSA and 529) regardless of what you set up here." />
+          </>
+        }
+      >
+        <div>
+          <WithdrawalPrioritiesEditor
+            bare
+            lineDefs={inputs.withdrawalLineDefs}
+            onLineDefsChange={handleWithdrawalLineDefsChange}
+            prioritySets={inputs.withdrawalPrioritySets}
+            onPrioritySetsChange={handleWithdrawalPrioritySetsChange}
+            spouseEnabled={inputs.spouseEnabled}
+          />
+        </div>
+        <div className="mt-5 border-t border-slate-100 pt-4">
+          <WithdrawalRangesEditor
+            bare
+            ranges={inputs.withdrawalRanges}
+            onChange={(ranges) => onChange({ ...inputs, withdrawalRanges: ranges })}
+            lineDefs={inputs.withdrawalLineDefs}
+            prioritySets={inputs.withdrawalPrioritySets}
+            spouseEnabled={inputs.spouseEnabled}
+            birthYear={birthYear(inputs.birthDate)}
+            deathYear={deathYr}
+            specialYears={inputs.specialYears}
+            mode={yearMode}
+            history={formulaHistory}
+          />
+        </div>
+      </CollapsibleSection>
 
       <CollapsibleSection
         title={
@@ -767,108 +1002,6 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
         </div>
       </CollapsibleSection>
 
-      <CollapsibleSection title="Current account balances">
-        {inputs.spouseEnabled ? (
-          <div className="flex flex-col gap-5">
-            <div>
-              <h3 className="text-sm font-semibold text-slate-600">You</h3>
-              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <OwnedBalanceFields
-                  balances={inputs.balances.self}
-                  onChange={(b) =>
-                    onChange({ ...inputs, balances: { ...inputs.balances, self: b } })
-                  }
-                />
-              </div>
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-slate-600">Spouse</h3>
-              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <OwnedBalanceFields
-                  balances={inputs.balances.spouse}
-                  onChange={(b) =>
-                    onChange({ ...inputs, balances: { ...inputs.balances, spouse: b } })
-                  }
-                />
-              </div>
-            </div>
-            <div>
-              <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
-                Shared
-                <HelpTooltip text="Taxable brokerage, HSA, cash, and high-yield savings are tracked as combined household accounts rather than split between spouses." />
-              </h3>
-              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <SharedBalanceFields
-                  balances={inputs.balances.shared}
-                  onChange={(b) =>
-                    onChange({ ...inputs, balances: { ...inputs.balances, shared: b } })
-                  }
-                />
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <OwnedBalanceFields
-              balances={inputs.balances.self}
-              onChange={(b) =>
-                onChange({ ...inputs, balances: { ...inputs.balances, self: b } })
-              }
-            />
-            <SharedBalanceFields
-              balances={inputs.balances.shared}
-              onChange={(b) =>
-                onChange({ ...inputs, balances: { ...inputs.balances, shared: b } })
-              }
-            />
-          </div>
-        )}
-      </CollapsibleSection>
-
-      <SpecialYearsEditor
-        specialYears={inputs.specialYears}
-        onChange={handleSpecialYearsChange}
-        birthYear={birthYear(inputs.birthDate)}
-        deathYear={deathYr}
-        mode={yearMode}
-        onModeChange={setYearMode}
-      />
-
-      <CollapsibleSection
-        title={
-          <>
-            Income
-            <HelpTooltip text="Name each source of income you might have, e.g. a job's wages, with a base amount in today's dollars. Then build an income plan of year ranges below, each referencing those sources with an amount for that specific range." />
-          </>
-        }
-      >
-        <div>
-          <NamedAmountCatalogEditor
-            bare
-            title="Sources"
-            help="Reference these by name in the plan below, where the amount can be overridden per range."
-            emptyMessage='No income sources yet — add one, e.g. "Job 1 wage".'
-            namePlaceholder="e.g. Job 1 wage"
-            addLabel="Add income source"
-            removeLabel="Remove income source"
-            defs={inputs.incomeSourceDefs}
-            onChange={handleIncomeSourceDefsChange}
-          />
-        </div>
-        <div className="mt-5 border-t border-slate-100 pt-4">
-          <IncomeRangesEditor
-            bare
-            ranges={inputs.incomeRanges}
-            onChange={(ranges) => onChange({ ...inputs, incomeRanges: ranges })}
-            incomeSourceDefs={inputs.incomeSourceDefs}
-            birthYear={birthYear(inputs.birthDate)}
-            deathYear={deathYr}
-            specialYears={inputs.specialYears}
-            mode={yearMode}
-          />
-        </div>
-      </CollapsibleSection>
-
       <CollapsibleSection
         title={
           <>
@@ -882,7 +1015,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
             label="You"
             config={inputs.socialSecurity.self}
             onChange={(self) => updateSocialSecurity({ self })}
-            incomeSourceDefs={inputs.incomeSourceDefs}
+            variables={inputs.variables}
             benefitSummary={computeOwnerBenefitSummary(inputs, 'self')}
             inputs={inputs}
             owner="self"
@@ -892,7 +1025,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
               label="Spouse"
               config={inputs.socialSecurity.spouse}
               onChange={(spouse) => updateSocialSecurity({ spouse })}
-              incomeSourceDefs={inputs.incomeSourceDefs}
+              variables={inputs.variables}
               benefitSummary={computeOwnerBenefitSummary(inputs, 'spouse')}
               inputs={inputs}
               owner="spouse"
@@ -1047,122 +1180,6 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
               />
             </div>
           </div>
-        </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        title={
-          <>
-            Spending
-            <HelpTooltip text="Name each category of spending, e.g. Groceries or Travel, with a base amount in today's dollars. Then build a spending plan of year ranges below, each referencing those buckets with an amount for that specific range." />
-          </>
-        }
-      >
-        <div>
-          <NamedAmountCatalogEditor
-            bare
-            title="Buckets"
-            help="Reference these by name in the plan below, where the amount can be overridden per range."
-            emptyMessage='No spending buckets yet — add one, e.g. "Groceries".'
-            namePlaceholder="e.g. Groceries"
-            addLabel="Add spending bucket"
-            removeLabel="Remove spending bucket"
-            defs={inputs.spendingBucketDefs}
-            onChange={handleSpendingBucketDefsChange}
-            renderExtraField={(def, updateDef) => (
-              <label className="flex items-center gap-1.5 text-sm text-slate-600">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                  checked={def.educationRelated ?? false}
-                  onChange={(e) => updateDef({ educationRelated: e.target.checked })}
-                />
-                Education related
-              </label>
-            )}
-          />
-        </div>
-        <div className="mt-5 border-t border-slate-100 pt-4">
-          <SpendingRangesEditor
-            bare
-            ranges={inputs.spendingRanges}
-            onChange={(ranges) => onChange({ ...inputs, spendingRanges: ranges })}
-            spendingBucketDefs={inputs.spendingBucketDefs}
-            birthYear={birthYear(inputs.birthDate)}
-            deathYear={deathYr}
-            specialYears={inputs.specialYears}
-            mode={yearMode}
-          />
-        </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        title={
-          <>
-            Savings
-            <HelpTooltip text="Define the accounts you contribute to, group them into named priorities, then build a savings plan of year ranges below, each referencing a priority with an amount for each of its lines." />
-          </>
-        }
-      >
-        <div>
-          <SavingsPrioritiesEditor
-            bare
-            lineDefs={inputs.savingsLineDefs}
-            onLineDefsChange={handleSavingsLineDefsChange}
-            prioritySets={inputs.savingsPrioritySets}
-            onPrioritySetsChange={handleSavingsPrioritySetsChange}
-            incomeSourceDefs={inputs.incomeSourceDefs}
-            spouseEnabled={inputs.spouseEnabled}
-          />
-        </div>
-        <div className="mt-5 border-t border-slate-100 pt-4">
-          <SavingsRangesEditor
-            bare
-            ranges={inputs.savingsRanges}
-            onChange={(ranges) => onChange({ ...inputs, savingsRanges: ranges })}
-            lineDefs={inputs.savingsLineDefs}
-            prioritySets={inputs.savingsPrioritySets}
-            incomeSourceDefs={inputs.incomeSourceDefs}
-            spouseEnabled={inputs.spouseEnabled}
-            birthYear={birthYear(inputs.birthDate)}
-            deathYear={deathYr}
-            specialYears={inputs.specialYears}
-            mode={yearMode}
-          />
-        </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        title={
-          <>
-            Withdrawals
-            <HelpTooltip text="Define the accounts you might withdraw from, group them into named priorities, then build a withdrawal plan of year ranges below, each referencing a priority with an amount for each of its lines. Note: the projection does not use these yet — it covers any shortfall in a fixed order (cash, then high-yield savings, then taxable, then pre-tax, then Roth, then HSA) regardless of what you set up here." />
-          </>
-        }
-      >
-        <div>
-          <WithdrawalPrioritiesEditor
-            bare
-            lineDefs={inputs.withdrawalLineDefs}
-            onLineDefsChange={handleWithdrawalLineDefsChange}
-            prioritySets={inputs.withdrawalPrioritySets}
-            onPrioritySetsChange={handleWithdrawalPrioritySetsChange}
-            spouseEnabled={inputs.spouseEnabled}
-          />
-        </div>
-        <div className="mt-5 border-t border-slate-100 pt-4">
-          <WithdrawalRangesEditor
-            bare
-            ranges={inputs.withdrawalRanges}
-            onChange={(ranges) => onChange({ ...inputs, withdrawalRanges: ranges })}
-            lineDefs={inputs.withdrawalLineDefs}
-            prioritySets={inputs.withdrawalPrioritySets}
-            spouseEnabled={inputs.spouseEnabled}
-            birthYear={birthYear(inputs.birthDate)}
-            deathYear={deathYr}
-            specialYears={inputs.specialYears}
-            mode={yearMode}
-          />
         </div>
       </CollapsibleSection>
 

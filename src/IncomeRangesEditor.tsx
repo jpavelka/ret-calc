@@ -1,33 +1,38 @@
+import type { FormulaHistoryContext } from './formula'
 import { IncomeAllocationsEditor } from './IncomeAllocationsEditor'
 import { PlanRangesEditor } from './PlanRangesEditor'
-import type { IncomePlanRange, IncomeSourceDef, SpecialYear } from './types'
+import type { IncomePlanRange, SpecialYear, Variable } from './types'
 import type { YearDisplayMode } from './useYearDisplayMode'
 
 interface IncomeRangesEditorProps {
   ranges: IncomePlanRange[]
   onChange: (ranges: IncomePlanRange[]) => void
-  incomeSourceDefs: IncomeSourceDef[]
+  variables: Variable[]
+  resolvedVariableAmounts: Map<string, number>
   birthYear: number | null
   deathYear: number | null
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
+  history?: FormulaHistoryContext
 }
 
 export function IncomeRangesEditor({
   ranges,
   onChange,
-  incomeSourceDefs,
+  variables,
+  resolvedVariableAmounts,
   birthYear,
   deathYear,
   specialYears,
   mode,
   bare = false,
+  history,
 }: IncomeRangesEditorProps) {
   return (
     <PlanRangesEditor
       title={bare ? 'Plan' : 'Income plan'}
-      description="Add a range for each period with different income, then set an amount for each income source that applies. Ranges can overlap — where they do, all overlapping ranges' income applies."
+      description="Add a range for each period with different income, then add a named line for each income source that applies. Ranges can overlap — where they do, all overlapping ranges' income applies."
       emptyMessage="No income ranges yet — add one to specify income for a period."
       addLabel="Add range"
       ranges={ranges}
@@ -51,7 +56,11 @@ export function IncomeRangesEditor({
         <IncomeAllocationsEditor
           allocations={range.allocations ?? []}
           onChange={(allocations) => updateRange({ allocations })}
-          incomeSourceDefs={incomeSourceDefs}
+          variables={variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          specialYears={specialYears}
+          deathYear={deathYear}
+          history={history}
         />
       )}
     />

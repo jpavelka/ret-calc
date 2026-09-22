@@ -1,7 +1,9 @@
 // The default rule for covering a shortfall: any required minimum
 // distribution comes out first (mandatory regardless of the shortfall size),
-// then cash, high-yield savings, taxable brokerage, pre-tax, Roth, and HSA,
-// accounting for the tax and penalty each draw triggers.
+// then this year's qualified medical and education spending comes out of HSA
+// and 529 respectively (each tax-free, up to the qualified amount), then
+// cash, high-yield savings, taxable brokerage, pre-tax, Roth, and whatever's
+// left of HSA and 529, accounting for the tax and penalty each draw triggers.
 //
 // Everything here is pure. The projection mutates its balances in place across
 // years, and the solver calls planWithdrawals repeatedly while it converges on
@@ -54,8 +56,8 @@ export interface WithdrawalContext {
   // Whether the HSA holder has reached 65, after which a non-qualified
   // distribution is ordinary income but no longer carries the 20% penalty.
   hsaPenaltyFree: boolean
-  // Medical spending this year that an HSA draw can cover tax-free. Currently
-  // always 0 — nothing populates it yet.
+  // Medical spending this year that an HSA draw can cover tax-free — the sum
+  // of spending lines flagged medicalRelated.
   qualifiedMedicalExpenses: number
   // Education spending this year a 529 draw can cover tax-free — federal and
   // state, regardless of basis vs. earnings split (the qualified-distribution
@@ -244,19 +246,47 @@ export function planWithdrawals(
     remaining = Math.max(0, remaining - take)
   }
 
-  // 2. Cash — untaxed, drawn only down to zero.
+  // 2. HSA, for this year's qualified medical expenses — drawn ahead of cash
+  // and every other source so the account actually pays for the medical
+  // spending it exists for, rather than sitting untouched until every other
+  // source is exhausted. Entirely tax- and penalty-free, since it never
+  // exceeds the qualified amount. Tracked against a running
+  // remainingQualifiedMedical rather than ctx.qualifiedMedicalExpenses
+  // directly, so step 9's non-qualified draw later doesn't double-count this.
+  let remainingQualifiedMedical = Math.max(0, ctx.qualifiedMedicalExpenses)
+  const defaultFromHsa = Math.min(remaining, available(sources.hsa), remainingQualifiedMedical)
+  if (defaultFromHsa > 0) {
+    byAccount.hsa += defaultFromHsa
+    remaining -= defaultFromHsa
+    remainingQualifiedMedical -= defaultFromHsa
+  }
+
+  // 3. 529, for this year's qualified education expenses — same reasoning as
+  // HSA above, and same basis-fraction invariant used again in step 10.
+  let remainingQualifiedEducation = Math.max(0, ctx.qualifiedEducationExpenses)
+  const defaultFrom529 = Math.min(remaining, available(sources.college529), remainingQualifiedEducation)
+  if (defaultFrom529 > 0) {
+    const basisFraction =
+      sources.college529 > 0 ? clamp(sources.college529Basis / sources.college529, 0, 1) : 1
+    college529BasisUsed += defaultFrom529 * basisFraction
+    byAccount.college529 += defaultFrom529
+    remaining -= defaultFrom529
+    remainingQualifiedEducation -= defaultFrom529
+  }
+
+  // 4. Cash — untaxed, drawn only down to zero.
   const fromCash = Math.min(remaining, available(sources.cash))
   byAccount.cash = fromCash
   remaining -= fromCash
 
-  // 3. High-yield savings — untaxed on withdrawal, same as cash: its interest
+  // 5. High-yield savings — untaxed on withdrawal, same as cash: its interest
   // was already taxed as ordinary income the year it was earned (see
   // runProjection), so what's left is just already-taxed principal.
   const fromHysa = Math.min(remaining, available(sources.hysa))
   byAccount.hysa = fromHysa
   remaining -= fromHysa
 
-  // 4. Taxable brokerage — pro-rata basis/gain split on the aggregate cost
+  // 6. Taxable brokerage — pro-rata basis/gain split on the aggregate cost
   // basis. Note the fraction is invariant under withdrawal: removing `a` at
   // fraction `b` leaves (basis - a*b)/(balance - a) = b, so the account's
   // marginal tax rate stays flat until it's exhausted.
@@ -272,7 +302,7 @@ export function planWithdrawals(
     remaining -= fromTaxable
   }
 
-  // 5. Pre-tax — any further shortfall beyond the RMD already drawn above.
+  // 7. Pre-tax — any further shortfall beyond the RMD already drawn above.
   // Fully ordinary income, penalised before 59½. Self before spouse; the
   // withdrawal-priority UI will supersede that ordering once it's wired to
   // the engine.
@@ -298,7 +328,7 @@ export function planWithdrawals(
     remaining -= take
   }
 
-  // 6. Roth — IRS ordering: contribution/conversion basis comes out first,
+  // 8. Roth — IRS ordering: contribution/conversion basis comes out first,
   // always tax- and penalty-free. Earnings are only reached once basis is
   // exhausted, and once the owner is 59½ the whole distribution is qualified,
   // so those earnings are tax-free too. Before 59½ they're ordinary income
@@ -334,44 +364,49 @@ export function planWithdrawals(
     remaining -= take
   }
 
-  // 7. HSA — tax-free up to this year's qualified medical expenses, the rest
-  // ordinary income plus a 20% penalty before 65.
-  const fromHsa = Math.min(remaining, available(sources.hsa))
+  // 9. HSA, for any further shortfall beyond step 2's default draw — tax-free
+  // up to what's left of this year's qualified medical expenses after step 2
+  // (remainingQualifiedMedical, not ctx.qualifiedMedicalExpenses, so that
+  // amount isn't credited twice), the rest ordinary income plus a 20% penalty
+  // before 65.
+  const fromHsa = Math.min(remaining, available(sources.hsa) - byAccount.hsa)
   if (fromHsa > 0) {
-    const taxFree = Math.min(fromHsa, Math.max(0, ctx.qualifiedMedicalExpenses))
+    const taxFree = Math.min(fromHsa, remainingQualifiedMedical)
     const nonQualified = fromHsa - taxFree
     ordinaryIncome += nonQualified
     ordinaryIncomeByAccount.hsa += nonQualified
     if (!ctx.hsaPenaltyFree) penalty += nonQualified * HSA_NON_QUALIFIED_PENALTY_RATE
-    byAccount.hsa = fromHsa
+    byAccount.hsa += fromHsa
     remaining -= fromHsa
   }
 
-  // 8. 529 — pro-rata basis/earnings split, same invariant-preserving math as
-  // the taxable-brokerage step (the basis fraction is unchanged by a
+  // 10. 529, for any further shortfall beyond step 3's default draw —
+  // pro-rata basis/earnings split, same invariant-preserving math as the
+  // taxable-brokerage step (the basis fraction is unchanged by a
   // proportional withdrawal). Placed last, after HSA: like HSA, it's a
   // specialized tax-advantaged account best preserved until other sources are
-  // exhausted. Up to this year's qualified education expenses comes out
-  // completely tax-free (federal and state), regardless of the basis split —
-  // that's the real 529 qualified-distribution exclusion. Only the earnings
-  // share of whatever's left non-qualified is taxable, plus a flat 10%
-  // federal-only penalty on that earnings share; there's no age exemption for
-  // 529s, unlike every other account in this waterfall. Note, same
-  // simplification as HSA's qualifiedMedicalExpenses: this doesn't verify the
-  // withdrawal actually funded the education spend, and unused qualified
-  // amount doesn't carry over — it's a per-year cap on whatever's drawn.
-  const from529 = Math.min(remaining, available(sources.college529))
+  // exhausted. Up to what's left of this year's qualified education expenses
+  // after step 3 (remainingQualifiedEducation) comes out completely tax-free
+  // (federal and state), regardless of the basis split — that's the real 529
+  // qualified-distribution exclusion. Only the earnings share of whatever's
+  // left non-qualified is taxable, plus a flat 10% federal-only penalty on
+  // that earnings share; there's no age exemption for 529s, unlike every
+  // other account in this waterfall. Note, same simplification as HSA's
+  // qualifiedMedicalExpenses: this doesn't verify the withdrawal actually
+  // funded the education spend, and unused qualified amount doesn't carry
+  // over — it's a per-year cap on whatever's drawn.
+  const from529 = Math.min(remaining, available(sources.college529) - byAccount.college529)
   if (from529 > 0) {
     const basisFraction =
       sources.college529 > 0 ? clamp(sources.college529Basis / sources.college529, 0, 1) : 1
-    college529BasisUsed = from529 * basisFraction
-    const qualified = Math.min(from529, Math.max(0, ctx.qualifiedEducationExpenses))
+    college529BasisUsed += from529 * basisFraction
+    const qualified = Math.min(from529, remainingQualifiedEducation)
     const nonQualified = from529 - qualified
     const nonQualifiedEarnings = nonQualified * (1 - basisFraction)
     ordinaryIncome += nonQualifiedEarnings
     ordinaryIncomeByAccount.college529 += nonQualifiedEarnings
     penalty += nonQualifiedEarnings * FIVE29_NON_QUALIFIED_PENALTY_RATE
-    byAccount.college529 = from529
+    byAccount.college529 += from529
     remaining -= from529
   }
 
