@@ -310,8 +310,9 @@ export function ProjectionTable({ rows, inputs, rates }: ProjectionTableProps) {
       <p className="mt-2 text-xs text-slate-500">
         {active.description}
         {rates &&
-          ' Return and Inflation show the historical year drawn for that simulated year — Return is ' +
-            'that year’s actual nominal market return, the same figure balances were grown by.'}
+          ' Return and Inflation show the historical year drawn for that simulated year (given in the ' +
+            'Data yr. column) — Return is that year’s actual nominal market return, the same figure ' +
+            'balances were grown by.'}
       </p>
 
       <div className="mt-4">
@@ -367,7 +368,7 @@ export function ProjectionSectionHeading() {
 const basicColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   YEAR_COL_WIDTH,
   ageColWidth(spouseEnabled),
-  ...(showRates ? [70, 70] : []),
+  ...(showRates ? [60, 70, 70] : []),
   100,
   100,
   100,
@@ -405,6 +406,7 @@ function BasicTable({
             <th className={`py-2 pr-3 ${STICKY_AGE_CLASS}`} style={STICKY_AGE_STYLE}>Age</th>
             {rates && (
               <>
+                <th className="py-2 pr-3 text-right">Data yr.</th>
                 <th className="py-2 pr-3 text-right">Return</th>
                 <th className="py-2 pr-3 text-right">Inflation</th>
               </>
@@ -434,6 +436,7 @@ function BasicTable({
               </td>
               {rates && (
                 <>
+                  <td className="py-1.5 pr-3 text-right text-slate-500">{rates[i].sourceYear ?? '–'}</td>
                   <td className="py-1.5 pr-3 text-right text-slate-700">{pct(nominalReturnPct(rates[i]))}</td>
                   <td className="py-1.5 pr-3 text-right text-slate-700">{pct(rates[i].inflationRatePct)}</td>
                 </>
@@ -470,6 +473,7 @@ function BasicTable({
             {/* Rates and balances aren't summed across years. */}
             {rates && (
               <>
+                <td className="py-1.5 pr-3" />
                 <td className="py-1.5 pr-3" />
                 <td className="py-1.5 pr-3" />
               </>
@@ -758,7 +762,7 @@ function accountRows(
 const standardColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   YEAR_COL_WIDTH,
   ageColWidth(spouseEnabled),
-  ...(showRates ? [70, 70] : []),
+  ...(showRates ? [60, 70, 70] : []),
   116,
   116,
   116,
@@ -824,6 +828,7 @@ function StandardTable({
             <th className={`py-2 pr-3 ${STICKY_AGE_CLASS}`} style={STICKY_AGE_STYLE}>Age</th>
             {rates && (
               <>
+                <th className="py-2 pr-3 text-right">Data yr.</th>
                 <th className="py-2 pr-3 text-right">Return</th>
                 <th className="py-2 pr-3 text-right">Inflation</th>
               </>
@@ -945,6 +950,7 @@ function StandardTable({
                 </td>
                 {rates && (
                   <>
+                    <td className="py-1.5 pr-3 text-right text-slate-500">{rates[i].sourceYear ?? '–'}</td>
                     <td className="py-1.5 pr-3 text-right text-slate-700">{pct(nominalReturnPct(rates[i]))}</td>
                     <td className="py-1.5 pr-3 text-right text-slate-700">{pct(rates[i].inflationRatePct)}</td>
                   </>
@@ -1035,6 +1041,7 @@ function StandardTable({
               <>
                 <td className="py-1.5 pr-3" />
                 <td className="py-1.5 pr-3" />
+                <td className="py-1.5 pr-3" />
               </>
             )}
             <td className="py-1.5 pr-3 text-right">${fmt(sum(rows, (r) => r.incomeTotal))}</td>
@@ -1097,6 +1104,9 @@ function GroupHeaderRow({ groups, showRates }: { groups: ColumnGroup[]; showRate
       </th>
       {showRates && (
         <>
+          <th rowSpan={2} className="border-b border-slate-200 py-2 px-2 text-right align-bottom">
+            Data yr.
+          </th>
           <th rowSpan={2} className="border-b border-slate-200 py-2 px-2 text-right align-bottom">
             Return
           </th>
@@ -1304,7 +1314,7 @@ function DetailedTable({
     cashGroup,
     netWorthGroup,
   ]
-  const totalCols = 2 + (rates ? 2 : 0) + groups.reduce((n, g) => n + g.columns.length, 0)
+  const totalCols = 2 + (rates ? 3 : 0) + groups.reduce((n, g) => n + g.columns.length, 0)
 
   // Savings columns show combined "$contribution + $match" text, and net-worth
   // figures are the largest numbers in the table, so both get extra room;
@@ -1314,7 +1324,7 @@ function DetailedTable({
   const colWidths = [
     YEAR_COL_WIDTH,
     ageColWidth(spouseEnabled),
-    ...(rates ? [70, 70] : []),
+    ...(rates ? [60, 70, 70] : []),
     ...groups.flatMap((g) => g.columns.map(() => colWidthForGroup(g.label))),
   ]
 
@@ -1502,6 +1512,7 @@ function DetailedTable({
 
                 {rates && (
                   <>
+                    <td className="py-1 px-2 text-right text-slate-500">{rates[i].sourceYear ?? '–'}</td>
                     <td className="py-1 px-2 text-right text-slate-700">{pct(nominalReturnPct(rates[i]))}</td>
                     <td className="py-1 px-2 text-right text-slate-700">{pct(rates[i].inflationRatePct)}</td>
                   </>
@@ -1686,6 +1697,7 @@ function DetailedTable({
             {/* Rates aren't summed across years. */}
             {rates && (
               <>
+                <td className="py-1 px-2" />
                 <td className="py-1 px-2" />
                 <td className="py-1 px-2" />
               </>

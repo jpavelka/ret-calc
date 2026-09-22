@@ -344,6 +344,10 @@ function requiredMinimumDistribution(
 export interface YearlyRates {
   realReturnRatePct: number
   inflationRatePct: number
+  // The historical calendar year this draw was bootstrapped from (see
+  // simulation.ts's toYearlyRates), for display alongside a simulation's
+  // year-by-year detail. Undefined for a flat-rate override.
+  sourceYear?: number
 }
 
 type Balances = WithdrawalBalances

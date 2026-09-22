@@ -10,7 +10,7 @@ import type { RetirementInputs } from './types'
 function toYearlyRates(historical: HistoricalMarketYear): YearlyRates {
   const realReturnRatePct =
     ((1 + historical.nominalReturnPct / 100) / (1 + historical.inflationPct / 100) - 1) * 100
-  return { realReturnRatePct, inflationRatePct: historical.inflationPct }
+  return { realReturnRatePct, inflationRatePct: historical.inflationPct, sourceYear: historical.year }
 }
 
 // The inverse of toYearlyRates' real-return conversion: recombining a drawn
