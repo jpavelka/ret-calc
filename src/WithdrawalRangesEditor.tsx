@@ -1,47 +1,48 @@
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { PlanRangesEditor } from './PlanRangesEditor'
-import { syncAllocationsToLineIds } from './prioritySetSync'
-import { RangePriorityEditor } from './RangePriorityEditor'
-import type {
-  SpecialYear,
-  WithdrawalLineDef,
-  WithdrawalPlanRange,
-  WithdrawalPrioritySet,
-} from './types'
+import type { SpecialYear, Variable, WithdrawalPlanRange } from './types'
 import type { YearDisplayMode } from './useYearDisplayMode'
+import { findOverlappingRangeIds } from './validation'
+import { WithdrawalRangeLinesEditor } from './WithdrawalRangeLinesEditor'
 
 interface WithdrawalRangesEditorProps {
   ranges: WithdrawalPlanRange[]
   onChange: (ranges: WithdrawalPlanRange[]) => void
-  lineDefs: WithdrawalLineDef[]
-  prioritySets: WithdrawalPrioritySet[]
+  variables: Variable[]
+  resolvedVariableAmounts: Map<string, number>
   spouseEnabled: boolean
   birthYear: number | null
+  spouseBirthYear?: number | null
   deathYear: number | null
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
   history?: FormulaHistoryContext
+  functions?: FormulaFunctionsContext
 }
 
 export function WithdrawalRangesEditor({
   ranges,
   onChange,
-  lineDefs,
-  prioritySets,
+  variables,
+  resolvedVariableAmounts,
   spouseEnabled,
   birthYear,
+  spouseBirthYear = null,
   deathYear,
   specialYears,
   mode,
   bare = false,
   history,
+  functions,
 }: WithdrawalRangesEditorProps) {
+  const overlappingIds = findOverlappingRangeIds(ranges)
+
   return (
     <PlanRangesEditor
       title={bare ? 'Plan' : 'Withdrawal plan'}
-      description="Add a range for each period, pick a withdrawal priority, then set an amount for each of its lines. Ranges can overlap — where they do, all overlapping ranges' withdrawals apply."
-      emptyMessage="No withdrawal ranges yet — add one to specify withdrawals for a period."
+      description="Add a range for each period, then list the accounts to draw from, in order, when income falls short. Ranges here can't overlap — only one withdrawal order can apply to a given year. A year not covered by any range uses the default order."
+      emptyMessage="No withdrawal ranges yet — every year uses the default order."
       addLabel="Add range"
       ranges={ranges}
       onChange={onChange}
@@ -58,33 +59,24 @@ export function WithdrawalRangesEditor({
         startSpecialYearOffset: 0,
         endSpecialYearId: null,
         endSpecialYearOffset: 0,
-        prioritySetId: null,
-        allocations: [],
+        lines: [],
       })}
+      extraErrorMessage={(range) =>
+        overlappingIds.has(range.id) ? 'Overlaps another range — only one withdrawal order can apply per year.' : null
+      }
       renderContent={(range, updateRange) => (
-        <RangePriorityEditor
-          title="Withdrawal priority"
-          help="Pick the named withdrawal priority to use for this range, then set an amount for each of its lines. Enter amounts in today's dollars — this app grows them for inflation."
-          noSetsMessage="Define a withdrawal priority above first."
-          noSetSelectedMessage="Select a withdrawal priority to enter amounts."
-          prioritySetId={range.prioritySetId ?? null}
-          onPrioritySetChange={(setId) => {
-            const set = prioritySets.find((s) => s.id === setId)
-            updateRange({
-              prioritySetId: setId,
-              allocations: set
-                ? syncAllocationsToLineIds(range.allocations, set.lineIds)
-                : [],
-            })
-          }}
-          prioritySets={prioritySets}
-          lineDefs={lineDefs}
-          allocations={range.allocations ?? []}
-          onAllocationsChange={(allocations) => updateRange({ allocations })}
+        <WithdrawalRangeLinesEditor
+          lines={range.lines}
+          onChange={(lines) => updateRange({ lines })}
+          variables={variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
           spouseEnabled={spouseEnabled}
           specialYears={specialYears}
           deathYear={deathYear}
+          selfBirthYear={birthYear}
+          spouseBirthYear={spouseBirthYear}
           history={history}
+          functions={functions}
         />
       )}
     />

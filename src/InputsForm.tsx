@@ -3,33 +3,49 @@ import { birthYear, calculateAge, deathYear } from './age'
 import { AwiTableEditor } from './AwiTableEditor'
 import {
   convertDanglingIncomeVariableRefs,
+  convertDanglingRothConversionVariableRefs,
   convertDanglingSavingsRangeVariableRefs,
   convertDanglingSpendingVariableRefs,
   convertDanglingWithdrawalRangeVariableRefs,
+  freezeFormulaRefsInGoals,
+  freezeFormulaRefsInMetrics,
   freezeFormulaRefsInRanges,
+  freezeFormulaRefsInRothConversionRanges,
   freezeFormulaRefsInSavingsRanges,
   freezeFormulaRefsInVariables,
+  freezeFormulaRefsInWithdrawalRanges,
   freezeSpecialYearRefsInSavingsRanges,
   pruneDanglingMatchSourcesInSavingsRanges,
+  renameFormulaRefsInFunctions,
+  renameFormulaRefsInGoals,
+  renameFormulaRefsInMetrics,
   renameFormulaRefsInRanges,
+  renameFormulaRefsInRothConversionRanges,
   renameFormulaRefsInSavingsRanges,
   renameFormulaRefsInVariables,
+  renameFormulaRefsInWithdrawalRanges,
   renameSpecialYearRefsInSavingsRanges,
 } from './catalogSync'
 import { CheckboxField } from './CheckboxField'
 import { CollapsibleSection } from './CollapsibleSection'
 import { CurrencyField } from './CurrencyField'
 import { DateField } from './DateField'
+import { DividendPolicyRangesEditor } from './DividendPolicyRangesEditor'
 import { flatRateHistoryContext } from './formula'
 import { FraTableEditor } from './FraTableEditor'
+import { buildFormulaFunctions } from './functions'
+import { FunctionsEditor } from './FunctionsEditor'
+import { GoalsEditor } from './GoalsEditor'
 import { HelpTooltip } from './HelpTooltip'
 import { IncomeRangesEditor } from './IncomeRangesEditor'
+import { MetricsEditor } from './MetricsEditor'
 import { NumberField } from './NumberField'
-import { pruneDanglingLineIds, syncRangesToPrioritySets } from './prioritySetSync'
+import { accountBalanceSnapshot, totalNetWorth, type YearProjectionRow } from './projection'
 import { resolveVariableAmounts } from './variables'
 import { RmdDivisorsEditor } from './RmdDivisorsEditor'
 import { RothConversionRangesEditor } from './RothConversionRangesEditor'
 import { SavingsRangesEditor } from './SavingsRangesEditor'
+import type { SimulationRun } from './simulation'
 import { resolveInputsSpecialYears } from './specialYearsSync'
 import { computeOwnerBenefitSummary, type SocialSecurityBenefitSummary } from './socialSecurity'
 import { SocialSecurityBenefitChart } from './SocialSecurityBenefitChart'
@@ -40,6 +56,8 @@ import { StateContributionDeductionsEditor } from './StateContributionDeductions
 import { TaxBracketsEditor } from './TaxBracketsEditor'
 import { VariablesEditor } from './VariablesEditor'
 import type {
+  CustomFunction,
+  Metric,
   Owner,
   OwnedAccountBalances,
   RetirementInputs,
@@ -48,16 +66,22 @@ import type {
   SocialSecurityOwnerConfig,
   SpecialYear,
   Variable,
-  WithdrawalLineDef,
-  WithdrawalPrioritySet,
 } from './types'
 import { useYearDisplayMode } from './useYearDisplayMode'
-import { WithdrawalPrioritiesEditor } from './WithdrawalPrioritiesEditor'
 import { WithdrawalRangesEditor } from './WithdrawalRangesEditor'
 
 interface InputsFormProps {
   inputs: RetirementInputs
   onChange: (inputs: RetirementInputs) => void
+  // The current (baseline, flat-rate) projection — threaded through only for
+  // GoalsEditor's per-goal Met/Not met badge and MetricsEditor's per-metric
+  // Avg badge; nothing else here needs it.
+  projectionRows: YearProjectionRow[]
+  // Latest Monte Carlo runs (null if none have been run yet) — threaded
+  // through only for GoalsEditor's/MetricsEditor's simulation badges, which
+  // mirror what the right-hand GoalPanel shows so the same results are
+  // reachable on narrow screens where that panel is hidden.
+  simulationRuns: SimulationRun[] | null
 }
 
 const COLUMN_CLASSES = {
@@ -66,18 +90,20 @@ const COLUMN_CLASSES = {
 } as const
 
 function Section({
+  id,
   title,
   description,
   columns = 3,
   children,
 }: {
+  id?: string
   title: string
   description?: string
   columns?: keyof typeof COLUMN_CLASSES
   children: React.ReactNode
 }) {
   return (
-    <CollapsibleSection title={title} subtitle={description}>
+    <CollapsibleSection id={id} title={title} subtitle={description}>
       <div className={`grid grid-cols-1 gap-4 ${COLUMN_CLASSES[columns]}`}>
         {children}
       </div>
@@ -373,38 +399,100 @@ function SocialSecurityOwnerFields({
   )
 }
 
-export function InputsForm({ inputs, onChange }: InputsFormProps) {
+export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }: InputsFormProps) {
   const age = calculateAge(inputs.birthDate)
   const spouseAge = inputs.spouseEnabled ? calculateAge(inputs.spouseBirthDate) : null
   const deathYr = deathYear(inputs.birthDate, inputs.lifeExpectancy)
+  // birthYear (not calculateAge's DOB-precise age above) is what every
+  // formula/condition preview's "age"/"spouseAge" is built from — same
+  // year-level granularity as "year" itself and the rest of the app's
+  // age-display mode (see YearBoundaryField/SpecialYearsEditor).
+  const selfBirthYear = birthYear(inputs.birthDate)
+  const spouseBirthYear = inputs.spouseEnabled ? birthYear(inputs.spouseBirthDate) : null
   const [yearMode, setYearMode] = useYearDisplayMode()
-  const resolvedVariables = useMemo(() => resolveVariableAmounts(inputs.variables), [inputs.variables])
+  const functionsContext = useMemo(() => buildFormulaFunctions(inputs.functions), [inputs.functions])
+  const resolvedVariables = useMemo(
+    () => resolveVariableAmounts(inputs.variables, functionsContext),
+    [inputs.variables, functionsContext],
+  )
   const resolvedVariableAmounts = resolvedVariables.amounts
-  // return_rate()/inflation_rate() in every live formula/condition preview
-  // below fall back to this flat scenario assumption — none of these editors
-  // run inside a real per-year projection loop, so there's no actual history
-  // to look back through (see runProjection's own historyContext for that).
+  // return_rate()/inflation_rate()/net_worth()/account-balance functions
+  // (pretax_self(), roth(), taxable(), ...) in every live formula/condition
+  // preview below fall back to this flat scenario assumption — none of these
+  // editors run inside a real per-year projection loop, so there's no actual
+  // history to look back through (see runProjection's own historyContext for
+  // that). net_worth()/account-balance functions fall back to today's
+  // starting balances, regardless of the lookback argument — the same "no
+  // real history, just today's snapshot" reasoning as the rate assumptions
+  // above. previous_income()/previous_spending() always return 0 here, since
+  // there's no "today's" income/spending total to fall back to.
   const formulaHistory = useMemo(
-    () => flatRateHistoryContext(inputs.expectedReturnRatePct, inputs.inflationRatePct),
-    [inputs.expectedReturnRatePct, inputs.inflationRatePct],
+    () =>
+      flatRateHistoryContext(
+        inputs.expectedReturnRatePct,
+        inputs.inflationRatePct,
+        totalNetWorth(inputs.balances),
+        accountBalanceSnapshot(inputs.balances),
+      ),
+    [inputs.expectedReturnRatePct, inputs.inflationRatePct, inputs.balances],
   )
 
   function handleSpecialYearsChange(specialYears: SpecialYear[]) {
-    // A savings line's condition can reference a special year by name (e.g.
-    // "year < [College]") — same text-level rename/freeze cascade as a
-    // Variable rename/delete (handleVariablesChange below), since nothing
-    // else here currently references special years by name.
+    // A savings line's condition (or a Goal's or Roth conversion amount's
+    // formula) can reference a special year by name (e.g. "year <
+    // [College]") — same text-level rename/freeze cascade as a Variable
+    // rename/delete (handleVariablesChange below). Income/spending/
+    // withdrawal formulas can reference special years too, but reuse
+    // renameFormulaRefsInRanges/renameFormulaRefsInWithdrawalRanges (and
+    // their freeze counterparts) directly since nothing about that cascade
+    // is variable-specific.
+    let incomeRanges = inputs.incomeRanges
+    let spendingRanges = inputs.spendingRanges
     let savingsRanges = inputs.savingsRanges
+    let withdrawalRanges = inputs.withdrawalRanges
+    let rothConversionRanges = inputs.rothConversionRanges
+    let goals = inputs.goals
+    let metrics = inputs.metrics
     for (const oldSpecialYear of inputs.specialYears) {
       const stillPresent = specialYears.find((s) => s.id === oldSpecialYear.id)
       if (stillPresent) {
         if (stillPresent.name === oldSpecialYear.name) continue
-        savingsRanges = renameSpecialYearRefsInSavingsRanges(savingsRanges, oldSpecialYear.name, stillPresent.name)
+        const oldName = oldSpecialYear.name
+        const newName = stillPresent.name
+        incomeRanges = renameFormulaRefsInRanges(incomeRanges, oldName, newName)
+        spendingRanges = renameFormulaRefsInRanges(spendingRanges, oldName, newName)
+        savingsRanges = renameSpecialYearRefsInSavingsRanges(savingsRanges, oldName, newName)
+        savingsRanges = renameFormulaRefsInSavingsRanges(savingsRanges, oldName, newName)
+        withdrawalRanges = renameFormulaRefsInWithdrawalRanges(withdrawalRanges, oldName, newName)
+        rothConversionRanges = renameFormulaRefsInRothConversionRanges(rothConversionRanges, oldName, newName)
+        goals = renameFormulaRefsInGoals(goals, oldName, newName)
+        metrics = renameFormulaRefsInMetrics(metrics, oldName, newName)
       } else {
-        savingsRanges = freezeSpecialYearRefsInSavingsRanges(savingsRanges, oldSpecialYear.name, oldSpecialYear.year)
+        const oldName = oldSpecialYear.name
+        const value = oldSpecialYear.year
+        incomeRanges = freezeFormulaRefsInRanges(incomeRanges, oldName, value)
+        spendingRanges = freezeFormulaRefsInRanges(spendingRanges, oldName, value)
+        savingsRanges = freezeSpecialYearRefsInSavingsRanges(savingsRanges, oldName, value)
+        savingsRanges = freezeFormulaRefsInSavingsRanges(savingsRanges, oldName, value)
+        withdrawalRanges = freezeFormulaRefsInWithdrawalRanges(withdrawalRanges, oldName, value)
+        rothConversionRanges = freezeFormulaRefsInRothConversionRanges(rothConversionRanges, oldName, value)
+        goals = freezeFormulaRefsInGoals(goals, oldName, value)
+        metrics = freezeFormulaRefsInMetrics(metrics, oldName, value)
       }
     }
-    onChange(resolveInputsSpecialYears({ ...inputs, specialYears, savingsRanges }))
+    onChange(
+      resolveInputsSpecialYears({
+        ...inputs,
+        specialYears,
+        incomeRanges,
+        spendingRanges,
+        savingsRanges,
+        withdrawalRanges,
+        rothConversionRanges,
+        goals,
+        metrics,
+      }),
+    )
   }
 
   function handleBirthDateChange(birthDate: string) {
@@ -431,7 +519,15 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       variables,
     )
     let withdrawalRanges = convertDanglingWithdrawalRangeVariableRefs(inputs.withdrawalRanges, validIds, oldVariablesById, oldResolvedAmounts)
+    let rothConversionRanges = convertDanglingRothConversionVariableRefs(
+      inputs.rothConversionRanges,
+      validIds,
+      oldVariablesById,
+      oldResolvedAmounts,
+    )
     let nextVariables = variables
+    let goals = inputs.goals
+    let metrics = inputs.metrics
 
     // A 'variable'-kind source links by id (handled above, immune to
     // renames). A formula's expression references a variable BY NAME, so it
@@ -445,25 +541,34 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
         incomeRanges = renameFormulaRefsInRanges(incomeRanges, oldName, newName)
         spendingRanges = renameFormulaRefsInRanges(spendingRanges, oldName, newName)
         savingsRanges = renameFormulaRefsInSavingsRanges(savingsRanges, oldName, newName)
-        withdrawalRanges = renameFormulaRefsInRanges(withdrawalRanges, oldName, newName)
+        withdrawalRanges = renameFormulaRefsInWithdrawalRanges(withdrawalRanges, oldName, newName)
+        rothConversionRanges = renameFormulaRefsInRothConversionRanges(rothConversionRanges, oldName, newName)
         nextVariables = renameFormulaRefsInVariables(nextVariables, oldName, newName)
+        goals = renameFormulaRefsInGoals(goals, oldName, newName)
+        metrics = renameFormulaRefsInMetrics(metrics, oldName, newName)
       } else {
         const value = oldResolvedAmounts.get(oldVar.id) ?? 0
         incomeRanges = freezeFormulaRefsInRanges(incomeRanges, oldVar.name, value)
         spendingRanges = freezeFormulaRefsInRanges(spendingRanges, oldVar.name, value)
         savingsRanges = freezeFormulaRefsInSavingsRanges(savingsRanges, oldVar.name, value)
-        withdrawalRanges = freezeFormulaRefsInRanges(withdrawalRanges, oldVar.name, value)
+        withdrawalRanges = freezeFormulaRefsInWithdrawalRanges(withdrawalRanges, oldVar.name, value)
+        rothConversionRanges = freezeFormulaRefsInRothConversionRanges(rothConversionRanges, oldVar.name, value)
         nextVariables = freezeFormulaRefsInVariables(nextVariables, oldVar.name, value)
+        goals = freezeFormulaRefsInGoals(goals, oldVar.name, value)
+        metrics = freezeFormulaRefsInMetrics(metrics, oldVar.name, value)
       }
     }
 
     onChange({
       ...inputs,
       variables: nextVariables,
+      goals,
+      metrics,
       incomeRanges,
       spendingRanges,
       savingsRanges,
       withdrawalRanges,
+      rothConversionRanges,
       socialSecurity: {
         ...inputs.socialSecurity,
         self: {
@@ -478,31 +583,51 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
     })
   }
 
-  function handleWithdrawalLineDefsChange(withdrawalLineDefs: WithdrawalLineDef[]) {
-    const validIds = new Set(withdrawalLineDefs.map((d) => d.id))
-    const withdrawalPrioritySets = pruneDanglingLineIds(
-      inputs.withdrawalPrioritySets,
-      validIds,
-    )
-    onChange({
-      ...inputs,
-      withdrawalLineDefs,
-      withdrawalPrioritySets,
-      withdrawalRanges: syncRangesToPrioritySets(
-        inputs.withdrawalRanges,
-        withdrawalPrioritySets,
-      ),
-    })
-  }
+  // A custom function is referenced by name only (never by id, unlike a
+  // Variable's 'variable'-kind source), so there's no dangling-ref
+  // conversion to do here — just a rename cascade, same text-level treatment
+  // as a Variable rename. Deleting a function is left as-is: any call sites
+  // start erroring ("Unknown function") rather than being frozen, since a
+  // function's result depends on its call site's own argument expressions,
+  // not a single resolved value the way a Variable's does.
+  function handleFunctionsChange(functions: CustomFunction[]) {
+    let incomeRanges = inputs.incomeRanges
+    let spendingRanges = inputs.spendingRanges
+    let savingsRanges = inputs.savingsRanges
+    let withdrawalRanges = inputs.withdrawalRanges
+    let rothConversionRanges = inputs.rothConversionRanges
+    let variables = inputs.variables
+    let goals = inputs.goals
+    let metrics = inputs.metrics
+    let nextFunctions = functions
 
-  function handleWithdrawalPrioritySetsChange(withdrawalPrioritySets: WithdrawalPrioritySet[]) {
+    for (const oldFn of inputs.functions) {
+      const stillPresent = functions.find((f) => f.id === oldFn.id)
+      if (!stillPresent || stillPresent.name === oldFn.name) continue
+      const oldName = oldFn.name
+      const newName = stillPresent.name
+      incomeRanges = renameFormulaRefsInRanges(incomeRanges, oldName, newName)
+      spendingRanges = renameFormulaRefsInRanges(spendingRanges, oldName, newName)
+      savingsRanges = renameFormulaRefsInSavingsRanges(savingsRanges, oldName, newName)
+      withdrawalRanges = renameFormulaRefsInWithdrawalRanges(withdrawalRanges, oldName, newName)
+      rothConversionRanges = renameFormulaRefsInRothConversionRanges(rothConversionRanges, oldName, newName)
+      variables = renameFormulaRefsInVariables(variables, oldName, newName)
+      goals = renameFormulaRefsInGoals(goals, oldName, newName)
+      metrics = renameFormulaRefsInMetrics(metrics, oldName, newName)
+      nextFunctions = renameFormulaRefsInFunctions(nextFunctions, oldName, newName)
+    }
+
     onChange({
       ...inputs,
-      withdrawalPrioritySets,
-      withdrawalRanges: syncRangesToPrioritySets(
-        inputs.withdrawalRanges,
-        withdrawalPrioritySets,
-      ),
+      functions: nextFunctions,
+      incomeRanges,
+      spendingRanges,
+      savingsRanges,
+      withdrawalRanges,
+      rothConversionRanges,
+      variables,
+      goals,
+      metrics,
     })
   }
 
@@ -525,7 +650,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
 
   return (
     <div className="flex flex-col gap-6">
-      <Section title="Assumptions" columns={4}>
+      <Section id="assumptions" title="Assumptions" columns={4}>
         <DateField
           label="Birth date"
           value={inputs.birthDate}
@@ -538,7 +663,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           min={0}
           value={inputs.lifeExpectancy}
           onChange={handleLifeExpectancyChange}
-          help="The age through which your plan is projected. Spending and withdrawals are assumed to continue through this age — also used as the built-in 'Death year' special year (birth year + life expectancy)."
+          help="The age through which your plan is projected. Spending and withdrawals are assumed to continue through this age — also used as the built-in 'Death year' (birth year + life expectancy) and 'Death age' (= this value) special years."
         />
         <NumberField
           label="Investment return"
@@ -548,6 +673,15 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           value={inputs.expectedReturnRatePct}
           onChange={(v) => onChange({ ...inputs, expectedReturnRatePct: v })}
           help="The average annual growth rate applied to your balances. This is a real return — already net of inflation — so don't subtract inflation from it yourself."
+        />
+        <NumberField
+          label="Dividend yield"
+          suffix="%"
+          min={0}
+          step={0.1}
+          value={inputs.dividendYieldRatePct}
+          onChange={(v) => onChange({ ...inputs, dividendYieldRatePct: v })}
+          help="The taxable brokerage's assumed annual dividend yield, carved out of Investment return above (not added on top) — so total growth is unchanged at 0%. Unlike Investment return, this isn't a real/inflation-adjusted rate — it's a plain percentage of the account's current balance, same as how a fund's dividend yield is normally quoted. Dividends are taxed as long-term capital gains the year they're paid, whether reinvested or paid out as cash (see the Dividend policy section below)."
         />
         <NumberField
           label="High-yield savings rate"
@@ -565,13 +699,13 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           step={0.1}
           value={inputs.inflationRatePct}
           onChange={(v) => onChange({ ...inputs, inflationRatePct: v })}
-          help="Used to grow the dollar amounts you enter throughout the app — income sources, spending, and savings/withdrawal priority amounts — over time, so they keep pace with the cost of living. Enter every dollar amount in today's dollars; the app takes care of inflating it."
+          help="Used to grow the dollar amounts you enter throughout the app — income sources, spending, and savings/withdrawal amounts — over time, so they keep pace with the cost of living. Enter every dollar amount in today's dollars; the app takes care of inflating it."
         />
         <CheckboxField
           label="Include spouse"
           checked={inputs.spouseEnabled}
           onChange={(checked) => onChange({ ...inputs, spouseEnabled: checked })}
-          help="Track a spouse's birth date separately, and assign accounts and savings/withdrawal priority lines to whichever spouse owns them. Needed later to work out penalty-free withdrawal ages per account owner."
+          help="Track a spouse's birth date separately, and assign accounts and savings/withdrawal lines to whichever spouse owns them. Needed later to work out penalty-free withdrawal ages per account owner."
         />
         {inputs.spouseEnabled && (
           <DateField
@@ -584,7 +718,57 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
         )}
       </Section>
 
-      <CollapsibleSection title="Current account balances">
+      <CollapsibleSection
+        id="goals"
+        title={
+          <>
+            Goals
+            <HelpTooltip text="Name a pass/fail check against the projection, e.g. 'Leave an inheritance' = netWorth > 100000 — tracked alongside the built-in 'Don't run out of money before death' goal above. A goal is met only if its formula holds true in every projected year; write a one-time milestone as an implication, e.g. 'age < 65 || netWorth > 500000'." />
+          </>
+        }
+      >
+        <GoalsEditor
+          goals={inputs.goals}
+          onChange={(goals) => onChange({ ...inputs, goals })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          specialYears={inputs.specialYears}
+          deathYear={deathYr}
+          selfBirthYear={selfBirthYear}
+          spouseBirthYear={spouseBirthYear}
+          history={formulaHistory}
+          functions={functionsContext}
+          projectionRows={projectionRows}
+          simulationRuns={simulationRuns}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        id="metrics"
+        title={
+          <>
+            Metrics
+            <HelpTooltip text="Name a numerical formula tracked against the projection, e.g. 'Average annual spending' = spending. Each metric below (and in the right-hand panel) reports the average across every projected year, plus a worst-to-best percentile chart across simulation runs once you've run one." />
+          </>
+        }
+      >
+        <MetricsEditor
+          metrics={inputs.metrics}
+          onChange={(metrics) => onChange({ ...inputs, metrics })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          specialYears={inputs.specialYears}
+          deathYear={deathYr}
+          selfBirthYear={selfBirthYear}
+          spouseBirthYear={spouseBirthYear}
+          history={formulaHistory}
+          functions={functionsContext}
+          projectionRows={projectionRows}
+          simulationRuns={simulationRuns}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection id="balances" title="Current account balances">
         {inputs.spouseEnabled ? (
           <div className="flex flex-col gap-5">
             <div>
@@ -643,6 +827,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="variables"
         title={
           <>
             Variables
@@ -656,6 +841,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           onChange={handleVariablesChange}
           resolvedVariables={resolvedVariables}
           history={formulaHistory}
+          functions={functionsContext}
         />
       </CollapsibleSection>
 
@@ -669,6 +855,25 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       />
 
       <CollapsibleSection
+        id="functions"
+        title={
+          <>
+            Functions
+            <HelpTooltip text="Define a reusable formula with named parameters, e.g. raise(base, pct) = base * (1 + pct / 100). Call it from any formula below as raise(salary, 3) — a function only sees its own parameters, not the variables above, and can call other functions here (but not itself, directly or indirectly)." />
+          </>
+        }
+      >
+        <FunctionsEditor
+          bare
+          functions={inputs.functions}
+          onChange={handleFunctionsChange}
+          functionsContext={functionsContext}
+          history={formulaHistory}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        id="income"
         title={
           <>
             Income
@@ -683,14 +888,17 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           variables={inputs.variables}
           resolvedVariableAmounts={resolvedVariableAmounts}
           birthYear={birthYear(inputs.birthDate)}
+          spouseBirthYear={spouseBirthYear}
           deathYear={deathYr}
           specialYears={inputs.specialYears}
           mode={yearMode}
           history={formulaHistory}
+          functions={functionsContext}
         />
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="spending"
         title={
           <>
             Spending
@@ -705,14 +913,17 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           variables={inputs.variables}
           resolvedVariableAmounts={resolvedVariableAmounts}
           birthYear={birthYear(inputs.birthDate)}
+          spouseBirthYear={spouseBirthYear}
           deathYear={deathYr}
           specialYears={inputs.specialYears}
           mode={yearMode}
           history={formulaHistory}
+          functions={functionsContext}
         />
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="savings"
         title={
           <>
             Savings
@@ -728,49 +939,43 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           resolvedVariableAmounts={resolvedVariableAmounts}
           spouseEnabled={inputs.spouseEnabled}
           birthYear={birthYear(inputs.birthDate)}
+          spouseBirthYear={spouseBirthYear}
           deathYear={deathYr}
           specialYears={inputs.specialYears}
           mode={yearMode}
           history={formulaHistory}
+          functions={functionsContext}
         />
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="withdrawals"
         title={
           <>
             Withdrawals
-            <HelpTooltip text="Define the accounts you might withdraw from, group them into named priorities, then build a withdrawal plan of year ranges below, each referencing a priority with an amount for each of its lines. Note: the projection does not use these yet — it covers any shortfall in a fixed order (that year's medical-related spending from the HSA and education-related spending from the 529, then cash, then high-yield savings, then taxable, then pre-tax, then Roth, then whatever's left of the HSA and 529) regardless of what you set up here." />
+            <HelpTooltip text="When income doesn't cover a year's spending, savings, and taxes, the shortfall is drawn from your accounts in the order you set here. Add a year range and list its withdrawal lines in order, each with an account and optional limits. Required minimum distributions always come out first. Years not covered by any range use the default order: HSA for that year's medical spending and 529 for its education spending, then cash, high-yield savings, taxable, pre-tax, Roth, and whatever's left of the HSA and 529." />
           </>
         }
       >
-        <div>
-          <WithdrawalPrioritiesEditor
-            bare
-            lineDefs={inputs.withdrawalLineDefs}
-            onLineDefsChange={handleWithdrawalLineDefsChange}
-            prioritySets={inputs.withdrawalPrioritySets}
-            onPrioritySetsChange={handleWithdrawalPrioritySetsChange}
-            spouseEnabled={inputs.spouseEnabled}
-          />
-        </div>
-        <div className="mt-5 border-t border-slate-100 pt-4">
-          <WithdrawalRangesEditor
-            bare
-            ranges={inputs.withdrawalRanges}
-            onChange={(ranges) => onChange({ ...inputs, withdrawalRanges: ranges })}
-            lineDefs={inputs.withdrawalLineDefs}
-            prioritySets={inputs.withdrawalPrioritySets}
-            spouseEnabled={inputs.spouseEnabled}
-            birthYear={birthYear(inputs.birthDate)}
-            deathYear={deathYr}
-            specialYears={inputs.specialYears}
-            mode={yearMode}
-            history={formulaHistory}
-          />
-        </div>
+        <WithdrawalRangesEditor
+          bare
+          ranges={inputs.withdrawalRanges}
+          onChange={(ranges) => onChange({ ...inputs, withdrawalRanges: ranges })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
+          spouseEnabled={inputs.spouseEnabled}
+          birthYear={birthYear(inputs.birthDate)}
+          spouseBirthYear={spouseBirthYear}
+          deathYear={deathYr}
+          specialYears={inputs.specialYears}
+          mode={yearMode}
+          history={formulaHistory}
+          functions={functionsContext}
+        />
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="taxes"
         title={
           <>
             Taxes
@@ -1003,6 +1208,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="social-security"
         title={
           <>
             Social Security
@@ -1184,6 +1390,7 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
       </CollapsibleSection>
 
       <CollapsibleSection
+        id="roth-conversions"
         title={
           <>
             Roth conversions
@@ -1195,7 +1402,32 @@ export function InputsForm({ inputs, onChange }: InputsFormProps) {
           bare
           ranges={inputs.rothConversionRanges}
           onChange={(ranges) => onChange({ ...inputs, rothConversionRanges: ranges })}
+          variables={inputs.variables}
+          resolvedVariableAmounts={resolvedVariableAmounts}
           spouseEnabled={inputs.spouseEnabled}
+          birthYear={birthYear(inputs.birthDate)}
+          spouseBirthYear={spouseBirthYear}
+          deathYear={deathYr}
+          specialYears={inputs.specialYears}
+          mode={yearMode}
+          history={formulaHistory}
+          functions={functionsContext}
+        />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        id="dividends"
+        title={
+          <>
+            Dividend policy
+            <HelpTooltip text="Whether the taxable brokerage's dividends are reinvested or paid out as cash, by year range. Dividends are taxed as long-term capital gains the year they're paid either way — only reinvest vs. cash affects what happens to the money and the account's cost basis." />
+          </>
+        }
+      >
+        <DividendPolicyRangesEditor
+          bare
+          ranges={inputs.dividendPolicyRanges}
+          onChange={(ranges) => onChange({ ...inputs, dividendPolicyRanges: ranges })}
           birthYear={birthYear(inputs.birthDate)}
           deathYear={deathYr}
           specialYears={inputs.specialYears}

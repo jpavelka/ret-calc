@@ -1,4 +1,4 @@
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { PlanRangesEditor } from './PlanRangesEditor'
 import { SpendingAllocationsEditor } from './SpendingAllocationsEditor'
 import type { SpecialYear, SpendingPlanRange, Variable } from './types'
@@ -10,11 +10,13 @@ interface SpendingRangesEditorProps {
   variables: Variable[]
   resolvedVariableAmounts: Map<string, number>
   birthYear: number | null
+  spouseBirthYear?: number | null
   deathYear: number | null
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
   history?: FormulaHistoryContext
+  functions?: FormulaFunctionsContext
 }
 
 export function SpendingRangesEditor({
@@ -23,11 +25,13 @@ export function SpendingRangesEditor({
   variables,
   resolvedVariableAmounts,
   birthYear,
+  spouseBirthYear = null,
   deathYear,
   specialYears,
   mode,
   bare = false,
   history,
+  functions,
 }: SpendingRangesEditorProps) {
   return (
     <PlanRangesEditor
@@ -60,7 +64,10 @@ export function SpendingRangesEditor({
           resolvedVariableAmounts={resolvedVariableAmounts}
           specialYears={specialYears}
           deathYear={deathYear}
+          selfBirthYear={birthYear}
+          spouseBirthYear={spouseBirthYear}
           history={history}
+          functions={functions}
         />
       )}
     />

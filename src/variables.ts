@@ -1,4 +1,5 @@
 import { extractIdentifiers, tryEvaluateFormula } from './formula'
+import type { FormulaFunctionsContext } from './formula'
 import type { Variable } from './types'
 
 export interface ResolvedVariables {
@@ -12,7 +13,10 @@ export interface ResolvedVariables {
 // Computed once from the day's variables list — a Variable's own value isn't
 // inflation-adjusted (that's decided per use, see AmountSource's inflation
 // flag), so this never needs to be recomputed per projection year.
-export function resolveVariableAmounts(variables: Variable[]): ResolvedVariables {
+// `functions` lets a Variable's own formula call a custom function (see
+// formula.ts) — optional since a caller with no functions catalog simply
+// can't use one, same as `history` elsewhere.
+export function resolveVariableAmounts(variables: Variable[], functions?: FormulaFunctionsContext): ResolvedVariables {
   const byId = new Map(variables.map((v) => [v.id, v]))
   const byName = new Map<string, Variable>()
   for (const v of variables) {
@@ -56,7 +60,7 @@ export function resolveVariableAmounts(variables: Variable[]): ResolvedVariables
         const ref = byName.get(name)
         if (ref) scope[name] = resolve(ref)
       }
-      const result = tryEvaluateFormula(v.source.expression, scope)
+      const result = tryEvaluateFormula(v.source.expression, scope, undefined, functions)
       if (result.ok) {
         value = result.value
       } else {

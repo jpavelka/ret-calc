@@ -1,9 +1,13 @@
 import { freezeIdentifierInExpression, renameIdentifierInExpression } from './formula'
 import type {
   AmountSource,
+  CustomFunction,
+  Goal,
   GoalTarget,
   IncomePlanRange,
-  SavingsLine,
+  Metric,
+  RothConversionAmount,
+  RothConversionPlanRange,
   SavingsPlanRange,
   SpendingPlanRange,
   Variable,
@@ -64,26 +68,23 @@ export function convertDanglingSpendingVariableRefs(
   }))
 }
 
-// Same idea as convertDanglingVariableSource above, for a SavingsLine's
-// `goal` — a GoalTarget is AmountSource-shaped (variable/custom/formula) but
-// has no `frequency`, so it can't share that generic helper.
-function convertDanglingGoalSource(
-  lines: SavingsLine[],
+// Same idea as convertDanglingVariableSource above, for a GoalTarget — a
+// SavingsLine's `goal` or a WithdrawalLine's `floor`. A GoalTarget is
+// AmountSource-shaped (variable/custom/formula) but has no `frequency`, so
+// it can't share that generic helper.
+function convertDanglingGoalTarget(
+  goal: GoalTarget | null | undefined,
   validVariableIds: Set<string>,
   variablesById: Map<string, Variable>,
   resolvedAmounts: Map<string, number>,
-): SavingsLine[] {
-  return lines.map((line) => {
-    const goal = line.goal
-    if (!goal || goal.kind !== 'variable' || validVariableIds.has(goal.variableId)) return line
-    const v = variablesById.get(goal.variableId)
-    const frozenGoal: GoalTarget = {
-      kind: 'custom',
-      amount: v ? (resolvedAmounts.get(v.id) ?? 0) : 0,
-      inflationAdjusted: goal.inflationAdjusted,
-    }
-    return { ...line, goal: frozenGoal }
-  })
+): GoalTarget | null | undefined {
+  if (!goal || goal.kind !== 'variable' || validVariableIds.has(goal.variableId)) return goal
+  const v = variablesById.get(goal.variableId)
+  return {
+    kind: 'custom',
+    amount: v ? (resolvedAmounts.get(v.id) ?? 0) : 0,
+    inflationAdjusted: goal.inflationAdjusted,
+  }
 }
 
 // Savings lines are defined directly on their range (no shared catalog — see
@@ -98,19 +99,14 @@ export function convertDanglingSavingsRangeVariableRefs(
 ): SavingsPlanRange[] {
   return ranges.map((range) => ({
     ...range,
-    lines: convertDanglingGoalSource(
-      convertDanglingVariableSource(range.lines ?? [], validVariableIds, variablesById, resolvedAmounts),
-      validVariableIds,
-      variablesById,
-      resolvedAmounts,
+    lines: convertDanglingVariableSource(range.lines ?? [], validVariableIds, variablesById, resolvedAmounts).map(
+      (line) => ({ ...line, goal: convertDanglingGoalTarget(line.goal, validVariableIds, variablesById, resolvedAmounts) }),
     ),
   }))
 }
 
-// Same idea, for withdrawal ranges — their PriorityAllocation lines gained a
-// full AmountSource (variable/custom/formula) alongside income/spending, so
-// a 'variable'-kind range allocation can go dangling too, same as an
-// income/spending line always could.
+// Same idea, for withdrawal ranges — a line's cap (`source`) and `floor` can
+// each reference a variable.
 export function convertDanglingWithdrawalRangeVariableRefs(
   ranges: WithdrawalPlanRange[],
   validVariableIds: Set<string>,
@@ -119,7 +115,40 @@ export function convertDanglingWithdrawalRangeVariableRefs(
 ): WithdrawalPlanRange[] {
   return ranges.map((range) => ({
     ...range,
-    allocations: convertDanglingVariableSource(range.allocations ?? [], validVariableIds, variablesById, resolvedAmounts),
+    lines: convertDanglingVariableSource(range.lines ?? [], validVariableIds, variablesById, resolvedAmounts).map(
+      (line) => ({ ...line, floor: convertDanglingGoalTarget(line.floor, validVariableIds, variablesById, resolvedAmounts) }),
+    ),
+  }))
+}
+
+// Same idea as convertDanglingVariableSource above, but for a
+// RothConversionAmount directly (amountSelf/amountSpouse aren't wrapped in a
+// `source` field the way an income/spending/savings/withdrawal line's is).
+function convertDanglingRothConversionAmount(
+  amount: RothConversionAmount,
+  validVariableIds: Set<string>,
+  variablesById: Map<string, Variable>,
+  resolvedAmounts: Map<string, number>,
+): RothConversionAmount {
+  if (amount.kind !== 'variable' || validVariableIds.has(amount.variableId)) return amount
+  const v = variablesById.get(amount.variableId)
+  return {
+    kind: 'custom',
+    amount: v ? (resolvedAmounts.get(v.id) ?? 0) : 0,
+    inflationAdjusted: amount.inflationAdjusted,
+  }
+}
+
+export function convertDanglingRothConversionVariableRefs(
+  ranges: RothConversionPlanRange[],
+  validVariableIds: Set<string>,
+  variablesById: Map<string, Variable>,
+  resolvedAmounts: Map<string, number>,
+): RothConversionPlanRange[] {
+  return ranges.map((range) => ({
+    ...range,
+    amountSelf: convertDanglingRothConversionAmount(range.amountSelf, validVariableIds, variablesById, resolvedAmounts),
+    amountSpouse: convertDanglingRothConversionAmount(range.amountSpouse, validVariableIds, variablesById, resolvedAmounts),
   }))
 }
 
@@ -179,7 +208,7 @@ export function freezeFormulaRefsInSources<T extends { source: AmountSource }>(
 }
 
 // Generic over any list of ranges whose lines are nested under `allocations`
-// — income/spending/savings/withdrawal ranges all share this shape.
+// — income and spending ranges share this shape.
 export function renameFormulaRefsInRanges<T extends { allocations: { source: AmountSource }[] }>(
   ranges: T[],
   oldName: string,
@@ -199,6 +228,46 @@ export function freezeFormulaRefsInRanges<T extends { allocations: { source: Amo
   return ranges.map((range) => ({
     ...range,
     allocations: freezeFormulaRefsInSources(range.allocations, name, value),
+  }))
+}
+
+function renameInRothConversionAmount(amount: RothConversionAmount, oldName: string, newName: string): RothConversionAmount {
+  if (amount.kind !== 'formula') return amount
+  return { ...amount, expression: renameIdentifierInExpression(amount.expression, oldName, newName) }
+}
+
+function freezeInRothConversionAmount(amount: RothConversionAmount, name: string, value: number): RothConversionAmount {
+  if (amount.kind !== 'formula') return amount
+  return { ...amount, expression: freezeIdentifierInExpression(amount.expression, name, value) }
+}
+
+// Roth conversion ranges aren't shaped like the other range types (no
+// `allocations`/`lines` array — just a direct amountSelf/amountSpouse pair
+// per range), so they need their own rename/freeze pair rather than reusing
+// renameFormulaRefsInRanges. A conversion amount's formula can reference a
+// Variable, custom Function, or special year by name, same as any other
+// formula field, so this same pair covers all three rename cascades.
+export function renameFormulaRefsInRothConversionRanges(
+  ranges: RothConversionPlanRange[],
+  oldName: string,
+  newName: string,
+): RothConversionPlanRange[] {
+  return ranges.map((range) => ({
+    ...range,
+    amountSelf: renameInRothConversionAmount(range.amountSelf, oldName, newName),
+    amountSpouse: renameInRothConversionAmount(range.amountSpouse, oldName, newName),
+  }))
+}
+
+export function freezeFormulaRefsInRothConversionRanges(
+  ranges: RothConversionPlanRange[],
+  name: string,
+  value: number,
+): RothConversionPlanRange[] {
+  return ranges.map((range) => ({
+    ...range,
+    amountSelf: freezeInRothConversionAmount(range.amountSelf, name, value),
+    amountSpouse: freezeInRothConversionAmount(range.amountSpouse, name, value),
   }))
 }
 
@@ -252,8 +321,9 @@ export function freezeFormulaRefsInSavingsRanges(
 // A savings line's `condition` can reference a special year by name (e.g.
 // "year < [College]"), the same way a formula references a Variable by
 // name — so a special year rename/delete needs the identical text-level
-// rename/freeze treatment. Scoped to `condition` only: unlike a Variable,
-// nothing else (source/goal) references special years today.
+// rename/freeze treatment. A Goal's formula can too, but reuses
+// renameFormulaRefsInGoals/freezeFormulaRefsInGoals above directly since
+// nothing about that cascade is savings-specific.
 export function renameSpecialYearRefsInSavingsRanges(
   ranges: SavingsPlanRange[],
   oldName: string,
@@ -282,6 +352,39 @@ export function freezeSpecialYearRefsInSavingsRanges(
   }))
 }
 
+// Withdrawal-range siblings of the savings helpers above: a line's cap
+// (`source`), `floor`, and `condition` can all reference a Variable, custom
+// Function, or special year by name.
+export function renameFormulaRefsInWithdrawalRanges(
+  ranges: WithdrawalPlanRange[],
+  oldName: string,
+  newName: string,
+): WithdrawalPlanRange[] {
+  return ranges.map((range) => ({
+    ...range,
+    lines: renameFormulaRefsInSources(range.lines, oldName, newName).map((line) => ({
+      ...line,
+      floor: renameInGoal(line.floor, oldName, newName),
+      condition: line.condition ? renameIdentifierInExpression(line.condition, oldName, newName) : line.condition,
+    })),
+  }))
+}
+
+export function freezeFormulaRefsInWithdrawalRanges(
+  ranges: WithdrawalPlanRange[],
+  name: string,
+  value: number,
+): WithdrawalPlanRange[] {
+  return ranges.map((range) => ({
+    ...range,
+    lines: freezeFormulaRefsInSources(range.lines, name, value).map((line) => ({
+      ...line,
+      floor: freezeInGoal(line.floor, name, value),
+      condition: line.condition ? freezeIdentifierInExpression(line.condition, name, value) : line.condition,
+    })),
+  }))
+}
+
 // Variables can themselves be formula-derived and reference OTHER variables
 // by name (see variables.ts) — a rename/delete needs the same treatment
 // applied to every other variable's own source, not just to lines.
@@ -299,4 +402,38 @@ export function freezeFormulaRefsInVariables(variables: Variable[], name: string
       ? { ...v, source: { kind: 'formula', expression: freezeIdentifierInExpression(v.source.expression, name, value) } }
       : v,
   )
+}
+
+// A CustomFunction's own body can call OTHER custom functions by name (see
+// formula.ts), so renaming one needs the same text-level cascade applied to
+// every other function's expression too — same idea as
+// renameFormulaRefsInVariables above. There's no freeze counterpart here: a
+// deleted function's call sites are deliberately left erroring rather than
+// frozen (see CustomFunction's doc comment) since a function's result
+// depends on its call site's own argument expressions, not a single
+// resolved value the way a Variable's does.
+export function renameFormulaRefsInFunctions(functions: CustomFunction[], oldName: string, newName: string): CustomFunction[] {
+  return functions.map((f) => ({ ...f, expression: renameIdentifierInExpression(f.expression, oldName, newName) }))
+}
+
+// A Goal's formula references a Variable/Function/special year by name, same
+// as a SavingsLine's condition — same text-level rename/freeze cascade. No
+// dangling-ref conversion needed (a Goal has no id-linked 'variable'-kind
+// source, only a formula), so this pair is all a Goal needs.
+export function renameFormulaRefsInGoals(goals: Goal[], oldName: string, newName: string): Goal[] {
+  return goals.map((g) => ({ ...g, expression: renameIdentifierInExpression(g.expression, oldName, newName) }))
+}
+
+export function freezeFormulaRefsInGoals(goals: Goal[], name: string, value: number): Goal[] {
+  return goals.map((g) => ({ ...g, expression: freezeIdentifierInExpression(g.expression, name, value) }))
+}
+
+// A Metric's formula references a Variable/Function/special year by name,
+// exactly like a Goal's — same text-level rename/freeze cascade.
+export function renameFormulaRefsInMetrics(metrics: Metric[], oldName: string, newName: string): Metric[] {
+  return metrics.map((m) => ({ ...m, expression: renameIdentifierInExpression(m.expression, oldName, newName) }))
+}
+
+export function freezeFormulaRefsInMetrics(metrics: Metric[], name: string, value: number): Metric[] {
+  return metrics.map((m) => ({ ...m, expression: freezeIdentifierInExpression(m.expression, name, value) }))
 }

@@ -23,12 +23,15 @@ interface Position {
 // popup there would get clipped by the scroll container or misaligned
 // against the sticky columns. Fixed-position + portal sidesteps both.
 //
-// Like HelpTooltip, built on <details>/<summary> so open/close needs no
-// click-outside handling — but unlike HelpTooltip, the panel must track the
-// button across scroll/resize while open, and close itself if the button
-// scrolls out of view or behind the sticky columns.
+// Like HelpTooltip, built on <details>/<summary>, closing on an outside
+// click — but since the panel is portaled outside `<details>`'s own DOM
+// subtree, that check also has to cover clicks landing inside the panel.
+// Unlike HelpTooltip, the panel must also track the button across
+// scroll/resize while open, and close itself if the button scrolls out of
+// view or behind the sticky columns.
 export function CellHelp({ label, children }: { label: string; children: ReactNode }) {
   const detailsRef = useRef<HTMLDetailsElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<Position | null>(null)
 
@@ -77,6 +80,20 @@ export function CellHelp({ label, children }: { label: string; children: ReactNo
     }
   }, [open, reposition])
 
+  useEffect(() => {
+    if (!open) return
+    const el = detailsRef.current
+    if (!el) return
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node
+      // The panel is portaled to <body>, outside `el`'s DOM subtree, so a
+      // click inside it must be checked separately or it'd look "outside".
+      if (!el.contains(target) && !panelRef.current?.contains(target)) el.open = false
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [open])
+
   return (
     <details ref={detailsRef} className="inline-block">
       <summary
@@ -89,6 +106,7 @@ export function CellHelp({ label, children }: { label: string; children: ReactNo
         pos &&
         createPortal(
           <div
+            ref={panelRef}
             style={{
               position: 'fixed',
               left: pos.left,

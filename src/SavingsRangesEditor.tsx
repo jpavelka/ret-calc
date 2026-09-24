@@ -1,4 +1,4 @@
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { PlanRangesEditor } from './PlanRangesEditor'
 import { SavingsRangeLinesEditor } from './SavingsRangeLinesEditor'
 import type { SavingsPlanRange, SpecialYear, Variable } from './types'
@@ -11,11 +11,13 @@ interface SavingsRangesEditorProps {
   resolvedVariableAmounts: Map<string, number>
   spouseEnabled: boolean
   birthYear: number | null
+  spouseBirthYear?: number | null
   deathYear: number | null
   specialYears: SpecialYear[]
   mode: YearDisplayMode
   bare?: boolean
   history?: FormulaHistoryContext
+  functions?: FormulaFunctionsContext
 }
 
 export function SavingsRangesEditor({
@@ -25,11 +27,13 @@ export function SavingsRangesEditor({
   resolvedVariableAmounts,
   spouseEnabled,
   birthYear,
+  spouseBirthYear = null,
   deathYear,
   specialYears,
   mode,
   bare = false,
   history,
+  functions,
 }: SavingsRangesEditorProps) {
   return (
     <PlanRangesEditor
@@ -63,7 +67,10 @@ export function SavingsRangesEditor({
           resolvedVariableAmounts={resolvedVariableAmounts}
           specialYears={specialYears}
           deathYear={deathYear}
+          selfBirthYear={birthYear}
+          spouseBirthYear={spouseBirthYear}
           history={history}
+          functions={functions}
         />
       )}
     />

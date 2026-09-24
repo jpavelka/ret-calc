@@ -1,12 +1,23 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { HelpTooltip } from './HelpTooltip'
 import { NumberField } from './NumberField'
 import { ProjectionTable } from './ProjectionTable'
-import { runSimulations, summarizeSimulations, type SimulationSummary } from './simulation'
+import { formatSuccessRatePct, summarizeSimulations, type SimulationRun } from './simulation'
 import type { RetirementInputs } from './types'
 
 interface SimulationPanelProps {
   inputs: RetirementInputs
+  // Lifted to App so GoalPanel can track custom-goal success across every
+  // run, not just the worst/p10/.../best bands summarizeSimulations keeps,
+  // and so GoalPanel's own "Run simulation" button uses the same config and
+  // in-flight state as this panel.
+  runs: SimulationRun[] | null
+  numSimulations: number
+  onNumSimulationsChange: (value: number) => void
+  blockLength: number
+  onBlockLengthChange: (value: number) => void
+  running: boolean
+  onRun: () => void
 }
 
 type Band = 'worst' | 'p10' | 'q1' | 'median' | 'q3' | 'p90' | 'best'
@@ -41,24 +52,19 @@ function Money({ value }: { value: number }) {
   )
 }
 
-export function SimulationPanel({ inputs }: SimulationPanelProps) {
-  const [numSimulations, setNumSimulations] = useState(100)
-  const [blockLength, setBlockLength] = useState(10)
-  const [summary, setSummary] = useState<SimulationSummary | null>(null)
+export function SimulationPanel({
+  inputs,
+  runs,
+  numSimulations,
+  onNumSimulationsChange,
+  blockLength,
+  onBlockLengthChange,
+  running,
+  onRun,
+}: SimulationPanelProps) {
   const [band, setBand] = useState<Band>('median')
-  const [running, setRunning] = useState(false)
 
-  function handleRun() {
-    setRunning(true)
-    // Deferred so the "Running…" state actually paints before the
-    // synchronous batch of projections (each with its own tax-solver loop)
-    // blocks the main thread.
-    setTimeout(() => {
-      const runs = runSimulations(inputs, numSimulations, undefined, blockLength)
-      setSummary(summarizeSimulations(runs))
-      setRunning(false)
-    }, 0)
-  }
+  const summary = useMemo(() => (runs ? summarizeSimulations(runs) : null), [runs])
 
   const selectedRun = summary?.[band] ?? null
 
@@ -79,7 +85,7 @@ export function SimulationPanel({ inputs }: SimulationPanelProps) {
           <NumberField
             label="Number of simulations"
             value={numSimulations}
-            onChange={setNumSimulations}
+            onChange={onNumSimulationsChange}
             min={1}
             step={1}
           />
@@ -88,14 +94,14 @@ export function SimulationPanel({ inputs }: SimulationPanelProps) {
           <NumberField
             label="Block length (years)"
             value={blockLength}
-            onChange={setBlockLength}
+            onChange={onBlockLengthChange}
             min={1}
             step={1}
           />
         </div>
         <button
           type="button"
-          onClick={handleRun}
+          onClick={onRun}
           disabled={running || numSimulations < 1 || blockLength < 1}
           className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
         >
@@ -106,7 +112,7 @@ export function SimulationPanel({ inputs }: SimulationPanelProps) {
       {summary && (
         <>
           <p className="flex items-center gap-1 text-sm font-medium text-slate-900">
-            Succeeded in {fmt(summary.successRatePct)}% of {numSimulations} simulations
+            Succeeded in {formatSuccessRatePct(summary.successRatePct)} of {numSimulations} simulations
             <HelpTooltip
               text={
                 'A run "succeeds" if it never has an unfunded withdrawal — every account ran ' +

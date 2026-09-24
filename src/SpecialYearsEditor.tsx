@@ -5,6 +5,7 @@ import { OffsetField } from './OffsetField'
 import {
   CURRENT_YEAR_SPECIAL_ID,
   CURRENT_YEAR_SPECIAL_NAME,
+  DEATH_AGE_SPECIAL_NAME,
   DEATH_YEAR_SPECIAL_ID,
   DEATH_YEAR_SPECIAL_NAME,
   getValidBaseOptions,
@@ -44,6 +45,15 @@ export function SpecialYearsEditor({
     onChange(specialYears.filter((s) => s.id !== id))
   }
 
+  function moveSpecialYear(index: number, direction: -1 | 1) {
+    const target = index + direction
+    if (target < 0 || target >= specialYears.length) return
+    const next = [...specialYears]
+    const [moved] = next.splice(index, 1)
+    next.splice(target, 0, moved)
+    onChange(next)
+  }
+
   function addSpecialYear() {
     onChange([
       ...specialYears,
@@ -59,10 +69,11 @@ export function SpecialYearsEditor({
 
   return (
     <CollapsibleSection
+      id="special-years"
       title={
         <>
           Special years
-          <HelpTooltip text="Name specific years (e.g. Retirement, Kids' college) so you can reference them when setting a range's start or end below, instead of typing a raw year. A special year can also be based on another, including the built-in 'Current year' or 'Death year' (birth year + life expectancy) (e.g. 'Kids' college' = Current year + 20), but not in a circular way. Changing a special year's value updates everything linked to it." />
+          <HelpTooltip text="Name specific years (e.g. Retirement, Kids' college) so you can reference them when setting a range's start or end below, instead of typing a raw year. A special year can also be based on another, including the built-in 'Current year' or 'Death year' (birth year + life expectancy) (e.g. 'Kids' college' = Current year + 20), but not in a circular way. Changing a special year's value updates everything linked to it. The built-in 'Death age' (the age reached in the death year, i.e. life expectancy) is also available in formula/condition fields, though — being an age, not a year — it can't be used as a range boundary or a base here." />
         </>
       }
       subtitle="Optional — only useful once you start defining year ranges below."
@@ -106,7 +117,7 @@ export function SpecialYearsEditor({
       )}
 
       <div className="mt-4 flex flex-col gap-2 first:mt-0">
-        {specialYears.map((special) => {
+        {specialYears.map((special, index) => {
           const validBases = getValidBaseOptions(specialYears, special.id)
           const linked = special.baseSpecialYearId !== null
           const base = special.baseSpecialYearId
@@ -123,6 +134,28 @@ export function SpecialYearsEditor({
               }`}
             >
               <div className="flex flex-wrap items-center gap-2">
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => moveSpecialYear(index, -1)}
+                    disabled={index === 0}
+                    aria-label="Move up"
+                    title="Move up"
+                    className="rounded-md border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moveSpecialYear(index, 1)}
+                    disabled={index === specialYears.length - 1}
+                    aria-label="Move down"
+                    title="Move down"
+                    className="rounded-md border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    ↓
+                  </button>
+                </div>
                 <input
                   type="text"
                   placeholder="e.g. Retirement"
@@ -216,8 +249,8 @@ export function SpecialYearsEditor({
 
               {nameReserved && (
                 <p className="mt-1 text-xs text-red-600">
-                  "{CURRENT_YEAR_SPECIAL_NAME}" and "{DEATH_YEAR_SPECIAL_NAME}" are reserved for
-                  the built-in options — pick a different name.
+                  "{CURRENT_YEAR_SPECIAL_NAME}", "{DEATH_YEAR_SPECIAL_NAME}", and "{DEATH_AGE_SPECIAL_NAME}"
+                  are reserved for the built-in options — pick a different name.
                 </p>
               )}
               {linked && !base && (

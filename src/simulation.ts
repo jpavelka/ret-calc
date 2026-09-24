@@ -1,5 +1,6 @@
 import { deathYear as computeDeathYear } from './age'
 import { HISTORICAL_MARKET_DATA, type HistoricalMarketYear } from './historicalMarketData'
+import { metricAverageInRun } from './metrics'
 import { runProjection, type YearlyRates, type YearProjectionRow } from './projection'
 import type { RetirementInputs } from './types'
 
@@ -121,6 +122,66 @@ export interface SimulationSummary {
 function percentile(sorted: SimulationRun[], p: number): SimulationRun {
   const index = Math.min(sorted.length - 1, Math.floor(p * sorted.length))
   return sorted[index]
+}
+
+// Same nearest-rank scheme as percentile() above, but over plain numbers —
+// used by summarizeMetric, where the "run" a percentile picks out is really
+// just that run's own average metric value, not a whole SimulationRun.
+function numericPercentile(sorted: number[], p: number): number {
+  const index = Math.min(sorted.length - 1, Math.floor(p * sorted.length))
+  return sorted[index]
+}
+
+export interface MetricPercentilePoint {
+  percentile: number
+  value: number
+}
+
+export interface MetricSimulationDistribution {
+  mean: number
+  // Every 5th percentile from 0 (worst run) to 100 (best run), in order —
+  // plotted as a curve rather than read as individual numbers. See
+  // MetricPercentileChart.
+  points: MetricPercentilePoint[]
+}
+
+// A Metric's distribution across a set of simulation runs: each run first
+// collapses to its own average value (metricAverageInRun — the same figure
+// the year-by-year projection reports for a single run), then this summarizes
+// THAT population of per-run averages, worst to best. Runs where the metric
+// never evaluated (metricAverageInRun returns null — e.g. every year errored)
+// are left out entirely rather than treated as zero. Null if no run has a
+// value to contribute.
+export function summarizeMetricDistribution(
+  metricId: string,
+  runs: SimulationRun[],
+): MetricSimulationDistribution | null {
+  const values = runs
+    .map((run) => metricAverageInRun(metricId, run.rows))
+    .filter((value): value is number => value !== null)
+    .sort((a, b) => a - b)
+
+  if (values.length === 0) return null
+
+  const points: MetricPercentilePoint[] = []
+  for (let p = 0; p <= 100; p += 5) {
+    points.push({ percentile: p, value: numericPercentile(values, p / 100) })
+  }
+
+  return {
+    mean: values.reduce((sum, v) => sum + v, 0) / values.length,
+    points,
+  }
+}
+
+// Rounding 99.6% to "100%" would overstate a rate that wasn't actually
+// perfect, so anything short of an exact 100 is capped at ">99%" instead.
+export function formatSuccessRatePct(value: number): string {
+  const rounded = Math.round(value)
+  if (rounded >= 100 && value < 100) {
+    return '>99%'
+  }
+  return `${rounded}%`
 }
 
 export function summarizeSimulations(runs: SimulationRun[]): SimulationSummary {

@@ -1,8 +1,10 @@
+import { useState } from 'react'
 import { accountHasOwner, ACCOUNT_LABELS, ACCOUNT_TYPES } from './accounts'
-import { AmountSourceEditor, AmountSourceFormulaRow } from './AmountSourceEditor'
+import { ageFormulaNames } from './age'
+import { AmountSourceEditor, AmountSourceFormulaRow, describeAmountSource } from './AmountSourceEditor'
 import { ConditionField } from './ConditionField'
-import type { FormulaHistoryContext } from './formula'
-import { GoalTargetEditor, GoalTargetFormulaRow } from './GoalTargetEditor'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
+import { describeGoalTarget, GoalTargetEditor, GoalTargetFormulaRow } from './GoalTargetEditor'
 import { HelpTooltip } from './HelpTooltip'
 import { calculateMatchAmount } from './match'
 import { NumberField } from './NumberField'
@@ -18,7 +20,10 @@ interface SavingsRangeLinesEditorProps {
   spouseEnabled: boolean
   specialYears: SpecialYear[]
   deathYear: number | null
+  selfBirthYear?: number | null
+  spouseBirthYear?: number | null
   history?: FormulaHistoryContext
+  functions?: FormulaFunctionsContext
 }
 
 // A savings range's own layered lines — the funding order (first line funded
@@ -34,8 +39,25 @@ export function SavingsRangeLinesEditor({
   spouseEnabled,
   specialYears,
   deathYear,
+  selfBirthYear = null,
+  spouseBirthYear = null,
   history,
+  functions,
 }: SavingsRangeLinesEditorProps) {
+  // Which lines are showing their full edit form — condensed, human-readable
+  // rows are the default so the section reads clearly at a glance; editing
+  // is opt-in per line.
+  const [editingIds, setEditingIds] = useState<Set<string>>(new Set())
+
+  function setEditing(id: string, editing: boolean) {
+    setEditingIds((prev) => {
+      const next = new Set(prev)
+      if (editing) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
   const variablesById = new Map(variables.map((v) => [v.id, v]))
   // The condition/formula preview evaluates against today's calendar year —
   // the same "preview today's resolved value" convention every other live
@@ -44,9 +66,12 @@ export function SavingsRangeLinesEditor({
   // precedence: special years, then variables (can shadow a same-named
   // special year), then "year" itself last — same order as runProjection.
   const specialYearNames = listSpecialYearNames(specialYears)
-  const conditionScope: Record<string, number> = specialYearPreviewScope(specialYears, deathYear)
+  const extraNames = ageFormulaNames(selfBirthYear, spouseBirthYear)
+  const conditionScope: Record<string, number> = specialYearPreviewScope(specialYears, deathYear, selfBirthYear, spouseBirthYear)
   for (const v of variables) conditionScope[v.name] = resolvedVariableAmounts.get(v.id) ?? 0
   conditionScope['year'] = new Date().getFullYear()
+  if (selfBirthYear !== null) conditionScope['age'] = conditionScope['year'] - selfBirthYear
+  if (spouseBirthYear !== null) conditionScope['spouseAge'] = conditionScope['year'] - spouseBirthYear
 
   function updateLine(id: string, patch: Partial<SavingsLine>) {
     onChange(lines.map((line) => (line.id === id ? { ...line, ...patch } : line)))
@@ -54,6 +79,7 @@ export function SavingsRangeLinesEditor({
 
   function removeLine(id: string) {
     onChange(lines.filter((line) => line.id !== id))
+    setEditing(id, false)
   }
 
   function moveLine(index: number, direction: -1 | 1) {
@@ -66,10 +92,11 @@ export function SavingsRangeLinesEditor({
   }
 
   function addLine() {
+    const id = crypto.randomUUID()
     onChange([
       ...lines,
       {
-        id: crypto.randomUUID(),
+        id,
         name: '',
         account: 'preTax',
         owner: 'self',
@@ -79,6 +106,9 @@ export function SavingsRangeLinesEditor({
         condition: null,
       },
     ])
+    // A brand-new line has nothing to summarize yet, so open it straight
+    // into edit mode instead of showing an empty condensed row.
+    setEditing(id, true)
   }
 
   function setMatch(line: SavingsLine, match: SavingsLine['match']) {
@@ -113,6 +143,7 @@ export function SavingsRangeLinesEditor({
     setMatch(line, {
       wageVariableId: null,
       tiers: [{ id: crypto.randomUUID(), salaryPercent: 0, matchPercent: 100 }],
+      account: null,
     })
   }
 
@@ -123,6 +154,11 @@ export function SavingsRangeLinesEditor({
   function updateWageVariableId(line: SavingsLine, wageVariableId: string | null) {
     if (!line.match) return
     setMatch(line, { ...line.match, wageVariableId })
+  }
+
+  function updateMatchAccount(line: SavingsLine, account: AccountType | null) {
+    if (!line.match) return
+    setMatch(line, { ...line.match, account })
   }
 
   function addMatchTier(line: SavingsLine) {
@@ -162,7 +198,12 @@ export function SavingsRangeLinesEditor({
           const matchSource = line.match ? variables.find((v) => v.id === line.match?.wageVariableId) : undefined
           const salary = matchSource ? resolvedVariableAmounts.get(matchSource.id) ?? 0 : 0
           const resolvedAmount =
-            resolveAllocation(line, variablesById, resolvedVariableAmounts, conditionScope, history)?.amount ?? 0
+            resolveAllocation(line, variablesById, resolvedVariableAmounts, conditionScope, history, functions)
+              ?.amount ?? 0
+
+          const editing = editingIds.has(line.id)
+          const ownerSuffix =
+            spouseEnabled && accountHasOwner(line.account) ? `, ${line.owner === 'spouse' ? 'Spouse' : 'You'}` : ''
 
           return (
             <div key={line.id} className="rounded-md border border-slate-200 p-2">
@@ -190,62 +231,138 @@ export function SavingsRangeLinesEditor({
                     ↓
                   </button>
                 </div>
-                <input
-                  type="text"
-                  placeholder="e.g. 401k Traditional"
-                  className="min-w-[8rem] flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
-                  value={line.name}
-                  onChange={(e) => updateLine(line.id, { name: e.target.value })}
-                />
-                <select
-                  className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
-                  value={line.account}
-                  onChange={(e) => {
-                    const account = e.target.value as AccountType
-                    updateLine(line.id, {
-                      account,
-                      owner: accountHasOwner(account) ? line.owner : 'self',
-                    })
-                  }}
-                >
-                  {ACCOUNT_TYPES.map((type) => (
-                    <option key={type} value={type}>
-                      {ACCOUNT_LABELS[type]}
-                    </option>
-                  ))}
-                </select>
-                <AmountSourceEditor
-                  source={line.source}
-                  onChange={(source) => updateLine(line.id, { source })}
-                  variables={variables}
-                  resolvedVariableAmounts={resolvedVariableAmounts}
-                  allowUnlimited
-                  specialYears={specialYears}
-                  deathYear={deathYear}
-                  history={history}
-                />
-                {spouseEnabled && accountHasOwner(line.account) && (
-                  <select
-                    aria-label="Account owner"
-                    className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
-                    value={line.owner}
-                    onChange={(e) => updateLine(line.id, { owner: e.target.value as Owner })}
-                  >
-                    <option value="self">You</option>
-                    <option value="spouse">Spouse</option>
-                  </select>
+
+                {editing ? (
+                  <>
+                    <input
+                      type="text"
+                      placeholder="e.g. 401k Traditional"
+                      className="min-w-[8rem] flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
+                      value={line.name}
+                      onChange={(e) => updateLine(line.id, { name: e.target.value })}
+                    />
+                    <select
+                      className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
+                      value={line.account}
+                      onChange={(e) => {
+                        const account = e.target.value as AccountType
+                        updateLine(line.id, {
+                          account,
+                          owner: accountHasOwner(account) ? line.owner : 'self',
+                        })
+                      }}
+                    >
+                      {ACCOUNT_TYPES.map((type) => (
+                        <option key={type} value={type}>
+                          {ACCOUNT_LABELS[type]}
+                        </option>
+                      ))}
+                    </select>
+                    <AmountSourceEditor
+                      source={line.source}
+                      onChange={(source) => updateLine(line.id, { source })}
+                      variables={variables}
+                      resolvedVariableAmounts={resolvedVariableAmounts}
+                      allowUnlimited
+                      specialYears={specialYears}
+                      deathYear={deathYear}
+                      selfBirthYear={selfBirthYear}
+                      spouseBirthYear={spouseBirthYear}
+                      history={history}
+                      functions={functions}
+                    />
+                    {spouseEnabled && accountHasOwner(line.account) && (
+                      <select
+                        aria-label="Account owner"
+                        className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
+                        value={line.owner}
+                        onChange={(e) => updateLine(line.id, { owner: e.target.value as Owner })}
+                      >
+                        <option value="self">You</option>
+                        <option value="spouse">Spouse</option>
+                      </select>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => removeLine(line.id)}
+                      aria-label="Remove savings line"
+                      title="Remove savings line"
+                      className="ml-auto rounded-md border border-red-300 px-2 py-1 text-red-600 hover:bg-red-50"
+                    >
+                      ✕
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                      <span className="font-medium text-slate-900">{line.name || 'Untitled'}</span>
+                      <span className="text-sm text-slate-500">
+                        {ACCOUNT_LABELS[line.account]}
+                        {ownerSuffix} ·{' '}
+                        {describeAmountSource(
+                          line.source,
+                          variables,
+                          resolvedVariableAmounts,
+                          specialYears,
+                          deathYear,
+                          history,
+                          functions,
+                          selfBirthYear,
+                          spouseBirthYear,
+                        )}
+                      </span>
+                      {line.match && (
+                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                          Match: ${calculateMatchAmount(resolvedAmount, salary, line.match.tiers).toLocaleString('en-US')}
+                          {line.match.account && line.match.account !== line.account
+                            ? ` → ${ACCOUNT_LABELS[line.match.account]}`
+                            : ''}
+                        </span>
+                      )}
+                      {line.goal && (
+                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                          Goal:{' '}
+                          {describeGoalTarget(
+                            line.goal,
+                            variables,
+                            resolvedVariableAmounts,
+                            specialYears,
+                            deathYear,
+                            history,
+                            functions,
+                            selfBirthYear,
+                            spouseBirthYear,
+                          )}
+                        </span>
+                      )}
+                      {line.condition != null && (
+                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                          Condition: {line.condition || '(empty)'}
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setEditing(line.id, true)}
+                      className="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 hover:bg-slate-50"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeLine(line.id)}
+                      aria-label="Remove savings line"
+                      title="Remove savings line"
+                      className="shrink-0 rounded-md border border-red-300 px-2 py-1 text-red-600 hover:bg-red-50"
+                    >
+                      ✕
+                    </button>
+                  </>
                 )}
-                <button
-                  type="button"
-                  onClick={() => removeLine(line.id)}
-                  aria-label="Remove savings line"
-                  title="Remove savings line"
-                  className="ml-auto rounded-md border border-red-300 px-2 py-1 text-red-600 hover:bg-red-50"
-                >
-                  ✕
-                </button>
               </div>
 
+              {!editing ? null : (
+              <>
               <AmountSourceFormulaRow
                 source={line.source}
                 onChange={(source) => updateLine(line.id, { source })}
@@ -253,7 +370,10 @@ export function SavingsRangeLinesEditor({
                 resolvedVariableAmounts={resolvedVariableAmounts}
                 specialYears={specialYears}
                 deathYear={deathYear}
+                selfBirthYear={selfBirthYear}
+                spouseBirthYear={spouseBirthYear}
                 history={history}
+                functions={functions}
               />
 
               <div className="mt-2 pl-6">
@@ -303,6 +423,25 @@ export function SavingsRangeLinesEditor({
                       </label>
                     )}
 
+                    <label className="flex flex-col gap-1">
+                      <span className="flex items-center gap-1 text-xs text-slate-500">
+                        Match goes to
+                        <HelpTooltip text="Which account the employer match itself lands in. Leave as 'Same as contribution' unless your plan puts the match somewhere different — e.g. many 401k plans deposit the match pre-tax even when you elect Roth for your own contribution." />
+                      </span>
+                      <select
+                        className="w-full max-w-xs rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
+                        value={line.match.account ?? ''}
+                        onChange={(e) => updateMatchAccount(line, (e.target.value || null) as AccountType | null)}
+                      >
+                        <option value="">Same as contribution ({ACCOUNT_LABELS[line.account]})</option>
+                        {ACCOUNT_TYPES.map((type) => (
+                          <option key={type} value={type}>
+                            {ACCOUNT_LABELS[type]}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
                     {line.match.tiers.map((tier, tierIndex) => (
                       <div key={tier.id} className="flex flex-wrap items-center gap-2">
                         <span className="text-xs text-slate-500">{tierIndex === 0 ? 'First' : 'Next'}</span>
@@ -351,6 +490,9 @@ export function SavingsRangeLinesEditor({
                     <p className="text-xs text-slate-400">
                       Est. employer match: ${calculateMatchAmount(resolvedAmount, salary, line.match.tiers).toLocaleString('en-US')}
                       {matchSource ? ` (against ${matchSource.name || 'Untitled'})` : ''}
+                      {line.match.account && line.match.account !== line.account
+                        ? ` — deposited to ${ACCOUNT_LABELS[line.match.account]}`
+                        : ''}
                     </p>
                   </div>
                 )}
@@ -388,7 +530,10 @@ export function SavingsRangeLinesEditor({
                         resolvedVariableAmounts={resolvedVariableAmounts}
                         specialYears={specialYears}
                         deathYear={deathYear}
+                        selfBirthYear={selfBirthYear}
+                        spouseBirthYear={spouseBirthYear}
                         history={history}
+                        functions={functions}
                       />
                     </div>
                     <GoalTargetFormulaRow
@@ -398,7 +543,10 @@ export function SavingsRangeLinesEditor({
                       resolvedVariableAmounts={resolvedVariableAmounts}
                       specialYears={specialYears}
                       deathYear={deathYear}
+                      selfBirthYear={selfBirthYear}
+                      spouseBirthYear={spouseBirthYear}
                       history={history}
+                      functions={functions}
                     />
                   </div>
                 )}
@@ -434,12 +582,26 @@ export function SavingsRangeLinesEditor({
                       onChange={(condition) => setCondition(line, condition)}
                       variables={variables}
                       specialYearNames={specialYearNames}
+                      extraNames={extraNames}
                       scope={conditionScope}
                       history={history}
+                      functions={functions}
                     />
                   </div>
                 )}
               </div>
+
+              <div className="mt-2 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setEditing(line.id, false)}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700"
+                >
+                  Done
+                </button>
+              </div>
+              </>
+              )}
             </div>
           )
         })}

@@ -127,13 +127,18 @@ export interface RetirementInputs {
   // reference as a yearly or monthly figure. The single source of truth for
   // a dollar value; a line can also skip this and hold its own custom amount.
   variables: Variable[]
-  withdrawalLineDefs: WithdrawalLineDef[]
-  // Named, ordered sequences of withdrawal lines (a whole waterfall priority
-  // given a name, e.g. "Standard priority"). Year ranges reference one of
-  // these by id instead of assembling the order from scratch. Savings has no
-  // catalog/priority-set equivalent — each SavingsPlanRange defines its own
-  // lines directly (see SavingsLine/SavingsPlanRange).
-  withdrawalPrioritySets: WithdrawalPrioritySet[]
+  // Named, parameterized formulas (e.g. raise(base, pct) = base * (1 + pct /
+  // 100)) callable by name from any formula below, including a Variable's
+  // own formula source — see formula.ts's FormulaFunctionsContext. A
+  // function's body sees only its own params as scope, not this catalog.
+  functions: CustomFunction[]
+  // User-defined pass/fail checks tracked alongside the built-in "don't run
+  // out of money before death" goal — see Goal above.
+  goals: Goal[]
+  // User-defined numerical formulas tracked per year, summarized as an
+  // average (year-by-year projection) or a distribution across runs
+  // (simulation) — see Metric above.
+  metrics: Metric[]
   // Each domain has its own independent set of year ranges — they don't need
   // to share boundaries, so e.g. your income ranges can differ from your
   // savings ranges.
@@ -143,10 +148,25 @@ export interface RetirementInputs {
   withdrawalRanges: WithdrawalPlanRange[]
   // Elective transfers from pre-tax to Roth ("Roth conversions"), e.g. to fill
   // up a low tax bracket in early retirement before Social Security/RMDs
-  // start. Unlike the withdrawal ranges above, these ARE read by the
-  // projection engine.
+  // start. Applied before the withdrawal waterfall, and never subject to the
+  // early-withdrawal penalty.
   rothConversionRanges: RothConversionPlanRange[]
+  // Per-year choice of whether the taxable brokerage's dividends (see
+  // dividendYieldRatePct) are reinvested or paid out as cash. Unlike the
+  // ranges above, these must NOT overlap — only one policy can apply to a
+  // given year — see findOverlappingRangeIds. A year not covered by any
+  // range defaults to 'reinvest'.
+  dividendPolicyRanges: DividendPolicyPlanRange[]
   expectedReturnRatePct: number
+  // The taxable brokerage's assumed annual dividend yield — carved out of
+  // the account's total growth (not added on top), so its balance is
+  // unchanged when this is 0. Unlike expectedReturnRatePct, this is a plain
+  // fraction of the account's current balance, not a real rate recombined
+  // with inflation — a yield is a ratio of dividends to current price,
+  // which doesn't itself drift with inflation the way a compounding return
+  // does. Dividends are taxed as long-term capital gains the year they're
+  // paid, whether reinvested or taken as cash — see runProjection.
+  dividendYieldRatePct: number
   // The high-yield savings account's real interest rate — like
   // expectedReturnRatePct, net of inflation, and recombined with it each year
   // to get the nominal rate the balance actually earns. Interest is taxed as
@@ -206,7 +226,7 @@ export interface SocialSecurityOwnerConfig {
   // "earningsHistory" method: which of inputs.variables count as this
   // owner's Social-Security-taxable wages for years not yet entered above
   // (today through claiming age) — referenced by id, same pattern as
-  // WithdrawalPrioritySet.lineIds. Those variables' projected income-allocation
+  // MatchConfig.wageVariableId. Those variables' projected income-allocation
   // amounts (from incomeRanges, capped at each year's wage base) fill in the
   // future years of the earnings history automatically.
   wageVariableIds: string[]
@@ -314,6 +334,12 @@ export interface MatchConfig {
   wageVariableId: string | null
   // Applied in order: the first tier's slice of salary, then the next, etc.
   tiers: MatchTier[]
+  // Which account the match itself lands in, e.g. a 401k plan that always
+  // deposits its match pre-tax even when the employee elects Roth. null
+  // means "same account as this line's own contribution" — also how
+  // scenarios saved before this field existed behave, so it's read as
+  // `?? line.account` wherever it's consumed.
+  account: AccountType | null
 }
 
 // How a Variable's own dollar amount is supplied: a flat number, or a
@@ -333,6 +359,50 @@ export interface Variable {
   id: string
   name: string
   source: VariableSource
+}
+
+// A named, parameterized formula, callable by name (e.g. "raise(salary, 3)")
+// from any formula elsewhere — a Variable's own formula source, an
+// income/spending/savings/withdrawal line, a goal, or a condition. `params`
+// is the function's ENTIRE scope when its own `expression` is evaluated — it
+// deliberately can't see the Variables catalog or the calling formula's
+// scope, so its result only ever depends on the arguments passed in. See
+// formula.ts's FormulaFunctionsContext/buildFormulaFunctions.
+export interface CustomFunction {
+  id: string
+  name: string
+  params: string[]
+  expression: string
+}
+
+// A user-defined pass/fail check against the projection, e.g. "Leave an
+// inheritance" = netWorth > 100000. Evaluated once per projected year (see
+// runProjection's goalScope/YearProjectionRow.goalResults) against that
+// year's netWorth/unfunded plus the same year/age/spouseAge/variable/special
+// year names available to any other condition — a goal is "met" only if its
+// formula holds in every projected year (an invariant, same idea as "never
+// run out of money"), so a one-time milestone like an age-65 balance check
+// needs writing as an implication, e.g. "age < 65 || netWorth > 500000". A
+// blank expression has no goal to check yet, so it's skipped rather than
+// counted as met or failed — see GoalPanel.
+export interface Goal {
+  id: string
+  name: string
+  expression: string
+}
+
+// A user-defined numerical formula, e.g. "Average annual spending" =
+// spending. Evaluated once per projected year (see runProjection's
+// goalScope/YearProjectionRow.metricResults), against the same
+// year/age/spouseAge/netWorth/unfunded/variable/special year names a Goal
+// formula sees. Unlike a Goal, a Metric has no pass/fail notion — the
+// year-by-year projection reports the average of its per-year values, and a
+// simulation reports the distribution (mean/worst/percentiles/best) of each
+// run's own average — see metricAverageInRun and GoalPanel.
+export interface Metric {
+  id: string
+  name: string
+  expression: string
 }
 
 export type Frequency = 'monthly' | 'yearly'
@@ -393,23 +463,6 @@ export interface SavingsLine {
   condition?: string | null
 }
 
-export interface WithdrawalLineDef {
-  id: string
-  name: string
-  account: AccountType
-  // Which spouse owns this account. Only meaningful when spouse mode is on
-  // and account is 'preTax' or 'roth' — taxable/hsa/cash/hysa accounts are always
-  // combined, so this is ignored (and irrelevant) for those.
-  owner: Owner
-}
-
-export interface WithdrawalPrioritySet {
-  id: string
-  name: string
-  // Ordered WithdrawalLineDef ids — the first is drawn first, then the next.
-  lineIds: string[]
-}
-
 // A named line item inside a plan range — e.g. "Base" spending $120,000/year,
 // sourced from a Variable or a custom one-off amount (see AmountSource).
 export interface IncomeAllocation {
@@ -432,12 +485,6 @@ export interface SpendingAllocation {
   // with scenarios saved before this field existed — read as `?? false`
   // wherever it's consumed.
   medicalRelated?: boolean
-}
-
-export interface PriorityAllocation {
-  id: string
-  lineId: string | null
-  source: AmountSource
 }
 
 // Shared by every domain's plan ranges. Ranges are always stored as actual
@@ -470,19 +517,71 @@ export interface SavingsPlanRange extends PlanRangeBounds {
   lines: SavingsLine[]
 }
 
-export interface WithdrawalPlanRange extends PlanRangeBounds {
-  prioritySetId: string | null
-  allocations: PriorityAllocation[]
+// One step of a withdrawal range's waterfall, defined directly on the range
+// (no shared catalog — same as SavingsLine). When a year's income falls
+// short, the shortfall is drawn from each applicable line in order until
+// it's covered; see planWithdrawals in withdrawals.ts. The same account may
+// appear more than once, e.g. HSA for qualified medical spending near the
+// top and whatever's left of it at the bottom.
+export interface WithdrawalLine {
+  id: string
+  name: string
+  account: AccountType
+  // Which spouse owns this account. Only meaningful when spouse mode is on
+  // and account is 'preTax' or 'roth' — every other account is combined.
+  owner: Owner
+  // The most this line draws in a year. { kind: 'unlimited' } means no cap:
+  // draw whatever the remaining shortfall needs.
+  source: AmountSource
+  // HSA/529 only: cap this line's draw at what's left of this year's
+  // qualified medical/education spending, so the whole draw is tax- and
+  // penalty-free. Ignored for other accounts. Optional; read as `?? false`.
+  qualifiedOnly?: boolean
+  // Never draw the account below this balance, e.g. to keep an emergency
+  // reserve. Optional; read as `?? null`.
+  floor?: GoalTarget | null
+  // Boolean formula gating whether this line applies in a given year — same
+  // semantics as SavingsLine.condition. Optional; read as `?? null`.
+  condition?: string | null
 }
 
+// Unlike income/spending/savings ranges, withdrawal ranges must NOT overlap —
+// two ordered waterfalls can't be combined — see findOverlappingRangeIds. A
+// year not covered by any range uses DEFAULT_WITHDRAWAL_ORDER. Required
+// minimum distributions are always taken first, ahead of these lines.
+export interface WithdrawalPlanRange extends PlanRangeBounds {
+  // Ordered — the first line is drawn first, then the next.
+  lines: WithdrawalLine[]
+}
+
+// A Roth conversion range's per-owner amount — like AmountSource, but always
+// a single annual dollar figure (so no frequency), unlike a periodic income/
+// spending/savings amount. Carries its own inflationAdjusted flag, same as
+// AmountSource/GoalTarget, so a conversion amount given in today's dollars
+// can optionally grow with inflation like those do, rather than always
+// holding flat.
+export type RothConversionAmount =
+  | { kind: 'variable'; variableId: string; inflationAdjusted: boolean }
+  | { kind: 'custom'; amount: number; inflationAdjusted: boolean }
+  | { kind: 'formula'; expression: string; inflationAdjusted: boolean }
+
 // How much to convert from pre-tax to Roth each year this range is active,
-// per owner. Always a non-negative dollar amount, in today's dollars — like
-// a savings/withdrawal line amount, held flat rather than grown for
-// inflation. amountSpouse is only meaningful (and only shown) when spouse
+// per owner. amountSpouse is only meaningful (and only shown) when spouse
 // mode is on; it's otherwise ignored by the projection.
 export interface RothConversionPlanRange extends PlanRangeBounds {
-  amountSelf: number
-  amountSpouse: number
+  amountSelf: RothConversionAmount
+  amountSpouse: RothConversionAmount
+}
+
+export type DividendPolicy = 'reinvest' | 'cash'
+
+// Whether the taxable brokerage's dividends are reinvested or paid out as
+// cash during this range of years. Unlike every other *PlanRange above,
+// these ranges must not overlap — a year has exactly one policy, so an
+// overlap is a validation error (see findOverlappingRangeIds) rather than
+// something that resolves by combining both.
+export interface DividendPolicyPlanRange extends PlanRangeBounds {
+  policy: DividendPolicy
 }
 
 export interface ScenarioSummary {
@@ -748,14 +847,17 @@ export const DEFAULT_INPUTS: RetirementInputs = {
   },
   specialYears: [],
   variables: [],
-  withdrawalLineDefs: [],
-  withdrawalPrioritySets: [],
+  functions: [],
+  goals: [],
+  metrics: [],
   incomeRanges: [],
   spendingRanges: [],
   savingsRanges: [],
   withdrawalRanges: [],
   rothConversionRanges: [],
+  dividendPolicyRanges: [],
   expectedReturnRatePct: 7,
+  dividendYieldRatePct: 1.5,
   hysaRealReturnRatePct: 0,
   inflationRatePct: 3,
   socialSecurity: DEFAULT_SOCIAL_SECURITY,

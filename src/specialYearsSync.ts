@@ -80,5 +80,10 @@ export function resolveInputsSpecialYears(inputs: RetirementInputs): RetirementI
       specialYears,
       deathYear,
     ),
+    dividendPolicyRanges: syncRangesToSpecialYears(
+      inputs.dividendPolicyRanges,
+      specialYears,
+      deathYear,
+    ),
   }
 }

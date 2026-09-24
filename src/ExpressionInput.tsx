@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { formulaReference } from './formula'
+import { FormulaHelp } from './FormulaHelp'
+import { BUILTIN_CONSTANT_NAMES } from './formula'
 import type { Variable } from './types'
 
 interface ExpressionInputProps {
   expression: string
   onChange: (expression: string) => void
   placeholder: string
-  // Candidate variables for the "insert variable" dropdown and the
-  // bracket quick-select below.
+  // Candidate variables for the bracket quick-select below.
   variables: Variable[]
-  // Special year names (including the built-in "Current year"/"Death year")
+  // Special year names (including the built-in "Current year"/"Death year"/"Death age")
   // offered alongside "year" and the variable catalog.
   specialYearNames?: string[]
-  insertAriaLabel: string
+  // Other synthetic (non-Variable) bare names offered alongside "year" —
+  // currently "age"/"spouseAge" (see age.ts's ageFormulaNames), offered only
+  // when the caller has a birth year to compute them from.
+  extraNames?: string[]
 }
 
 interface BracketQuery {
@@ -41,27 +44,34 @@ function findOpenBracket(expression: string, cursor: number): BracketQuery | nul
 }
 
 // Shared text-input core for FormulaField/ConditionField: the raw <input>,
-// an "Insert…" dropdown offering "year", special years, and variables, and a
-// quick-select popup that appears while typing inside "[...]" and filters as
-// you type — the same candidate list as the dropdown, since a bracketed
-// reference is how you'd write any name the dropdown offers that isn't a
-// bare identifier. Both fields wrap this with their own label/live-preview
-// line.
+// a quick-select popup that appears while typing inside "[...]" and filters
+// as you type — offering "year", extra synthetic names (age/spouseAge),
+// special years, and variables, bracket-wrapping any of them regardless of
+// whether the name is a bare identifier (see formula.ts's tokenize), so this
+// is the only affordance needed to insert one — and a "?" button opening the
+// full formula/function reference (FormulaHelp). Both fields wrap this with
+// their own label/live-preview line.
 export function ExpressionInput({
   expression,
   onChange,
   placeholder,
   variables,
   specialYearNames = [],
-  insertAriaLabel,
+  extraNames = [],
 }: ExpressionInputProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [bracketQuery, setBracketQuery] = useState<BracketQuery | null>(null)
   const [highlighted, setHighlighted] = useState(0)
 
   const allNames = useMemo(
-    () => ['year', ...specialYearNames, ...variables.map((v) => v.name || 'Untitled')],
-    [specialYearNames, variables],
+    () => [
+      'year',
+      ...extraNames,
+      ...specialYearNames,
+      ...BUILTIN_CONSTANT_NAMES,
+      ...variables.map((v) => v.name || 'Untitled'),
+    ],
+    [extraNames, specialYearNames, variables],
   )
 
   const matches = useMemo(() => {
@@ -82,23 +92,6 @@ export function ExpressionInput({
     }
     const cursor = input.selectionStart ?? input.value.length
     setBracketQuery(findOpenBracket(input.value, cursor))
-  }
-
-  function insertAtCursor(token: string) {
-    const input = inputRef.current
-    const start = input?.selectionStart ?? expression.length
-    const end = input?.selectionEnd ?? expression.length
-    const next = expression.slice(0, start) + token + expression.slice(end)
-    onChange(next)
-    requestAnimationFrame(() => {
-      input?.focus()
-      const cursor = start + token.length
-      input?.setSelectionRange(cursor, cursor)
-    })
-  }
-
-  function insertFromDropdown(name: string) {
-    insertAtCursor(name === 'year' ? 'year' : formulaReference(name))
   }
 
   function selectCandidate(name: string) {
@@ -156,39 +149,7 @@ export function ExpressionInput({
           setTimeout(() => setBracketQuery(null), 150)
         }}
       />
-      <select
-        aria-label={insertAriaLabel}
-        title={insertAriaLabel}
-        className="rounded-md border border-slate-300 bg-white px-1 py-1.5 text-sm text-slate-500 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
-        value=""
-        onChange={(e) => {
-          if (e.target.value) insertFromDropdown(e.target.value)
-          e.target.value = ''
-        }}
-      >
-        <option value="" disabled>
-          Insert…
-        </option>
-        <option value="year">year (simulation year)</option>
-        {specialYearNames.length > 0 && (
-          <optgroup label="Special years">
-            {specialYearNames.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </optgroup>
-        )}
-        {variables.length > 0 && (
-          <optgroup label="Variables">
-            {variables.map((v) => (
-              <option key={v.id} value={v.name}>
-                {v.name || 'Untitled'}
-              </option>
-            ))}
-          </optgroup>
-        )}
-      </select>
+      <FormulaHelp />
 
       {bracketQuery && matches.length > 0 && (
         <ul

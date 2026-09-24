@@ -1,8 +1,9 @@
+import { ageFormulaNames } from './age'
 import { CurrencyField } from './CurrencyField'
 import { FormulaField } from './FormulaField'
 import { FrequencyField } from './FrequencyField'
 import { tryEvaluateFormula } from './formula'
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { listSpecialYearNames, specialYearPreviewScope } from './specialYearGraph'
 import type { AmountSource, SpecialYear, Variable } from './types'
 
@@ -11,20 +12,31 @@ interface AmountSourceEditorProps {
   onChange: (source: AmountSource) => void
   variables: Variable[]
   resolvedVariableAmounts: Map<string, number>
-  // Offers the "Unlimited" kind — only meaningful on a SavingsLine with a
-  // goal ("contribute whatever it takes to reach it"), so only the savings
-  // line editor passes this; income/spending/withdrawal amounts leave it off.
+  // Offers the "Unlimited" kind — meaningful on a SavingsLine with a goal
+  // ("contribute whatever it takes to reach it") and on a WithdrawalLine
+  // ("no cap — draw whatever the shortfall needs"); income/spending amounts
+  // leave it off.
   allowUnlimited?: boolean
+  // What the "Unlimited" kind shows in place of an amount, and its tooltip —
+  // defaults to the savings-goal wording.
+  unlimitedLabel?: string
+  unlimitedTitle?: string
   // Special years and death year for a formula source's "year"/special-year
   // support — optional (defaulting to none) since a caller with no
   // meaningful year context can simply omit them.
   specialYears?: SpecialYear[]
   deathYear?: number | null
+  // "age"/"spouseAge" support for a formula source, same optionality as
+  // specialYears/deathYear above — a caller with no birth year just doesn't
+  // get those names.
+  selfBirthYear?: number | null
+  spouseBirthYear?: number | null
   // return_rate()/inflation_rate() support for the live preview — typically
   // flatRateHistoryContext(...) here, since a static preview has no real
   // per-year history to look back through. Optional; omitting it just makes
   // those two functions show an error in the preview instead of a value.
   history?: FormulaHistoryContext
+  functions?: FormulaFunctionsContext
 }
 
 // Not real ids — crypto.randomUUID() never collides with either — so they
@@ -38,8 +50,10 @@ function formulaScope(
   resolvedVariableAmounts: Map<string, number>,
   specialYears: SpecialYear[],
   deathYear: number | null,
+  selfBirthYear: number | null = null,
+  spouseBirthYear: number | null = null,
 ): Record<string, number> {
-  const scope: Record<string, number> = specialYearPreviewScope(specialYears, deathYear)
+  const scope: Record<string, number> = specialYearPreviewScope(specialYears, deathYear, selfBirthYear, spouseBirthYear)
   for (const v of variables) scope[v.name] = resolvedVariableAmounts.get(v.id) ?? 0
   return scope
 }
@@ -57,16 +71,22 @@ export function AmountSourceEditor({
   variables,
   resolvedVariableAmounts,
   allowUnlimited = false,
+  unlimitedLabel = 'Fills the savings goal below',
+  unlimitedTitle = "Contributes whatever it takes to reach this line's savings goal, with no per-period amount of its own",
   specialYears = [],
   deathYear = null,
+  selfBirthYear = null,
+  spouseBirthYear = null,
   history,
+  functions,
 }: AmountSourceEditorProps) {
   const formulaValue =
     source.kind === 'formula'
       ? tryEvaluateFormula(
           source.expression,
-          formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear),
+          formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear, selfBirthYear, spouseBirthYear),
           history,
+          functions,
         )
       : null
 
@@ -156,9 +176,9 @@ export function AmountSourceEditor({
       {source.kind === 'unlimited' && (
         <div
           className="flex min-w-[10rem] flex-1 items-center rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-slate-500"
-          title="Contributes whatever it takes to reach this line's savings goal, with no per-period amount of its own"
+          title={unlimitedTitle}
         >
-          Fills the savings goal below
+          {unlimitedLabel}
         </div>
       )}
 
@@ -186,6 +206,51 @@ export function AmountSourceEditor({
   )
 }
 
+// A short, human-readable summary of an AmountSource for condensed
+// (non-editing) display — e.g. '$2,000/mo from "Salary", inflation-adjusted'.
+// Mirrors the same amount resolution AmountSourceEditor uses for its live $
+// preview, so the summary always matches what editing would show.
+export function describeAmountSource(
+  source: AmountSource,
+  variables: Variable[],
+  resolvedVariableAmounts: Map<string, number>,
+  specialYears: SpecialYear[] = [],
+  deathYear: number | null = null,
+  history?: FormulaHistoryContext,
+  functions?: FormulaFunctionsContext,
+  selfBirthYear: number | null = null,
+  spouseBirthYear: number | null = null,
+): string {
+  if (source.kind === 'unlimited') return 'Unlimited — fills the savings goal'
+
+  const amount =
+    source.kind === 'variable'
+      ? (resolvedVariableAmounts.get(source.variableId) ?? 0)
+      : source.kind === 'custom'
+        ? source.amount
+        : (() => {
+            const result = tryEvaluateFormula(
+              source.expression,
+              formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear, selfBirthYear, spouseBirthYear),
+              history,
+              functions,
+            )
+            return result?.ok ? result.value : 0
+          })()
+
+  const amountText = `$${Math.round(amount).toLocaleString('en-US')}/${source.frequency === 'monthly' ? 'mo' : 'yr'}`
+  const inflationText = source.inflationAdjusted ? ', inflation-adjusted' : ', fixed'
+
+  if (source.kind === 'variable') {
+    const variable = variables.find((v) => v.id === source.variableId)
+    return `${amountText} from "${variable?.name || 'Untitled'}"${inflationText}`
+  }
+  if (source.kind === 'formula') {
+    return `${amountText} (${source.expression || 'no formula yet'})${inflationText}`
+  }
+  return `${amountText}${inflationText}`
+}
+
 // The formula text input itself (insert-variable dropdown + error-only
 // line, no redundant success preview since AmountSourceEditor's row already
 // shows the computed value) — rendered on its own line below the row
@@ -197,7 +262,10 @@ export function AmountSourceFormulaRow({
   resolvedVariableAmounts,
   specialYears = [],
   deathYear = null,
+  selfBirthYear = null,
+  spouseBirthYear = null,
   history,
+  functions,
 }: AmountSourceEditorProps) {
   if (source.kind !== 'formula') return null
   return (
@@ -208,8 +276,10 @@ export function AmountSourceFormulaRow({
       onChange={(expression) => onChange({ ...source, expression })}
       variables={variables}
       specialYearNames={listSpecialYearNames(specialYears)}
-      scope={formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear)}
+      extraNames={ageFormulaNames(selfBirthYear, spouseBirthYear)}
+      scope={formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear, selfBirthYear, spouseBirthYear)}
       history={history}
+      functions={functions}
     />
   )
 }

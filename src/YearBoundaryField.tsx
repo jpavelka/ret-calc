@@ -27,6 +27,32 @@ interface YearBoundaryFieldProps {
   }) => void
 }
 
+// A short, human-readable summary of a single boundary for condensed
+// (non-editing) display — e.g. '2030', 'age 45', or 'Retirement +2 (2032)'
+// for one linked to a special year.
+export function describeYearBoundary(
+  year: number,
+  specialYearId: string | null,
+  specialYearOffset: number,
+  specialYears: SpecialYear[],
+  mode: YearDisplayMode,
+  birthYear: number | null,
+  deathYear: number | null,
+): string {
+  const ageMode = mode === 'age' && birthYear !== null
+  const displayValue = ageMode ? year - (birthYear as number) : year
+  const plainText = ageMode ? `age ${displayValue}` : `${displayValue}`
+
+  if (!specialYearId) return plainText
+
+  const ref = resolveSpecialYearRef(specialYearId, specialYears, deathYear)
+  if (!ref) return 'linked special year removed'
+
+  const offset = specialYearOffset ?? 0
+  const offsetSuffix = offset ? ` ${offset > 0 ? '+' : ''}${offset}` : ''
+  return `${ref.name}${offsetSuffix} (${plainText})`
+}
+
 export function YearBoundaryField({
   label,
   year,

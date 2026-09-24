@@ -1,4 +1,5 @@
 import { birthYear } from './age'
+import { buildFormulaFunctions } from './functions'
 import { activeRanges, resolveAllocation } from './projection'
 import { resolveVariableAmounts } from './variables'
 import type { AwiYear, FraRow, Owner, RetirementInputs, SocialSecurityOwnerConfig } from './types'
@@ -225,7 +226,7 @@ export function projectFutureWages(
   const wageVariableIds = new Set(config.wageVariableIds)
   if (wageVariableIds.size === 0) return result
   const variablesById = new Map(inputs.variables.map((v) => [v.id, v]))
-  const resolvedVariableAmounts = resolveVariableAmounts(inputs.variables).amounts
+  const resolvedVariableAmounts = resolveVariableAmounts(inputs.variables, buildFormulaFunctions(inputs.functions)).amounts
 
   let inflationFactor = 1
   for (let year = fromYear; year <= throughYear; year++) {

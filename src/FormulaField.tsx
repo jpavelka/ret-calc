@@ -1,19 +1,22 @@
 import { ExpressionInput } from './ExpressionInput'
 import { tryEvaluateFormula } from './formula'
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { HelpTooltip } from './HelpTooltip'
 import type { Variable } from './types'
 
 interface FormulaFieldProps {
   expression: string
   onChange: (expression: string) => void
-  // Candidate variables for the "insert variable" dropdown.
+  // Candidate variables for the "[" bracket quick-select.
   variables: Variable[]
-  // Special year names (including the built-in "Current year"/"Death year")
+  // Special year names (including the built-in "Current year"/"Death year"/"Death age")
   // available to insert, alongside a synthetic "year" entry — same
   // candidates ConditionField offers, since a formula can reference the
   // simulation year and special years exactly like a condition can.
   specialYearNames?: string[]
+  // Other synthetic names available to insert — "age"/"spouseAge" — see
+  // ExpressionInput's extraNames.
+  extraNames?: string[]
   // Values to evaluate the live preview against, keyed by variable name.
   scope: Record<string, number>
   // Prior-year inflation/return rate lookback for return_rate()/
@@ -22,6 +25,9 @@ interface FormulaFieldProps {
   // so those functions still resolve to the flat scenario assumption instead
   // of erroring.
   history?: FormulaHistoryContext
+  // Custom functions callable from this formula by name — see
+  // VariablesEditor/InputsForm's functionsContext.
+  functions?: FormulaFunctionsContext
   label?: string
   hideLabel?: boolean
   help?: string
@@ -41,23 +47,25 @@ function formatCurrency(value: number): string {
 }
 
 // Text input for a formula expression, shared by line-level amounts
-// (AmountSourceEditor) and variable-level amounts (VariablesEditor): an
-// "insert variable" dropdown that inserts a name at the cursor (bracketed if
-// it isn't a valid bare identifier), plus a live preview/error line below.
+// (AmountSourceEditor) and variable-level amounts (VariablesEditor): typing
+// "[" opens a quick-select of variable/year names to insert, plus a live
+// preview/error line below.
 export function FormulaField({
   expression,
   onChange,
   variables,
   specialYearNames = [],
+  extraNames = [],
   scope,
   history,
+  functions,
   label = 'Formula',
   hideLabel = false,
   help,
   overrideError,
   hideSuccessPreview = false,
 }: FormulaFieldProps) {
-  const result = tryEvaluateFormula(expression, scope, history)
+  const result = tryEvaluateFormula(expression, scope, history, functions)
 
   return (
     <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
@@ -73,7 +81,7 @@ export function FormulaField({
         placeholder="e.g. 0.1 * salary"
         variables={variables}
         specialYearNames={specialYearNames}
-        insertAriaLabel="Insert variable"
+        extraNames={extraNames}
       />
       {overrideError ? (
         <span className="text-xs text-red-600">{overrideError}</span>

@@ -53,3 +53,16 @@ export function defaultBirthDate(age = 35): string {
   date.setFullYear(date.getFullYear() - age)
   return date.toISOString().slice(0, 10)
 }
+
+// The synthetic "age"/"spouseAge" formula names available alongside "year"
+// (see specialYearPreviewScope/runProjection's yearScope) — offered in
+// ExpressionInput's "[" quick-select wherever birth year(s) are known.
+// "spouseAge" only appears when a spouse birth year is available, same
+// gating as every other spouse-specific figure in this app (off when spouse
+// mode is off).
+export function ageFormulaNames(selfBirthYear: number | null, spouseBirthYear: number | null): string[] {
+  const names: string[] = []
+  if (selfBirthYear !== null) names.push('age')
+  if (spouseBirthYear !== null) names.push('spouseAge')
+  return names
+}

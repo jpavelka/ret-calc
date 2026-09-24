@@ -1,6 +1,8 @@
-import { useState, type KeyboardEvent, type ReactNode } from 'react'
+import { useEffect, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { TOC_EXPAND_EVENT, type TocExpandDetail } from './tocEvents'
 
 interface CollapsibleSectionProps {
+  id?: string
   title: ReactNode
   subtitle?: ReactNode
   headerRight?: ReactNode
@@ -9,6 +11,7 @@ interface CollapsibleSectionProps {
 }
 
 export function CollapsibleSection({
+  id,
   title,
   subtitle,
   headerRight,
@@ -16,6 +19,17 @@ export function CollapsibleSection({
   children,
 }: CollapsibleSectionProps) {
   const [open, setOpen] = useState(defaultOpen)
+
+  useEffect(() => {
+    if (!id) return
+    function handleExpand(e: Event) {
+      if ((e as CustomEvent<TocExpandDetail>).detail?.id === id) {
+        setOpen(true)
+      }
+    }
+    window.addEventListener(TOC_EXPAND_EVENT, handleExpand)
+    return () => window.removeEventListener(TOC_EXPAND_EVENT, handleExpand)
+  }, [id])
 
   function toggle() {
     setOpen((o) => !o)
@@ -29,7 +43,10 @@ export function CollapsibleSection({
   }
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+    <section
+      id={id}
+      className="scroll-mt-6 rounded-lg border border-slate-200 bg-white p-5 shadow-sm"
+    >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div
           role="button"

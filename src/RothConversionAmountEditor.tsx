@@ -4,19 +4,17 @@ import { FormulaField } from './FormulaField'
 import { tryEvaluateFormula } from './formula'
 import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { listSpecialYearNames, specialYearPreviewScope } from './specialYearGraph'
-import type { GoalTarget, SpecialYear, Variable } from './types'
+import type { RothConversionAmount, SpecialYear, Variable } from './types'
 
-interface GoalTargetEditorProps {
-  goal: GoalTarget
-  onChange: (goal: GoalTarget) => void
+interface RothConversionAmountEditorProps {
+  amount: RothConversionAmount
+  onChange: (amount: RothConversionAmount) => void
   variables: Variable[]
   resolvedVariableAmounts: Map<string, number>
   specialYears?: SpecialYear[]
   deathYear?: number | null
-  // See AmountSourceEditor's selfBirthYear/spouseBirthYear props.
   selfBirthYear?: number | null
   spouseBirthYear?: number | null
-  // See AmountSourceEditor's history prop.
   history?: FormulaHistoryContext
   functions?: FormulaFunctionsContext
 }
@@ -39,10 +37,11 @@ function formulaScope(
   return scope
 }
 
-// A short, human-readable summary of a GoalTarget for condensed
-// (non-editing) display — e.g. '$50,000 from "Home fund", inflation-adjusted'.
-export function describeGoalTarget(
-  goal: GoalTarget,
+// A short, human-readable summary of a RothConversionAmount for condensed
+// (non-editing) display — e.g. '$15,000, fixed' or
+// '$15,000 (0.1 * salary), inflation-adjusted'.
+export function describeRothConversionAmount(
+  amount: RothConversionAmount,
   variables: Variable[],
   resolvedVariableAmounts: Map<string, number>,
   specialYears: SpecialYear[] = [],
@@ -52,14 +51,14 @@ export function describeGoalTarget(
   selfBirthYear: number | null = null,
   spouseBirthYear: number | null = null,
 ): string {
-  const amount =
-    goal.kind === 'variable'
-      ? (resolvedVariableAmounts.get(goal.variableId) ?? 0)
-      : goal.kind === 'custom'
-        ? goal.amount
+  const value =
+    amount.kind === 'variable'
+      ? (resolvedVariableAmounts.get(amount.variableId) ?? 0)
+      : amount.kind === 'custom'
+        ? amount.amount
         : (() => {
             const result = tryEvaluateFormula(
-              goal.expression,
+              amount.expression,
               formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear, selfBirthYear, spouseBirthYear),
               history,
               functions,
@@ -67,31 +66,26 @@ export function describeGoalTarget(
             return result?.ok ? result.value : 0
           })()
 
-  const amountText = `$${Math.round(amount).toLocaleString('en-US')}`
-  const inflationText = goal.inflationAdjusted ? ', inflation-adjusted' : ', fixed'
+  const amountText = `$${Math.round(value).toLocaleString('en-US')}`
+  const inflationText = amount.inflationAdjusted ? ', inflation-adjusted' : ', fixed'
 
-  if (goal.kind === 'variable') {
-    const variable = variables.find((v) => v.id === goal.variableId)
+  if (amount.kind === 'variable') {
+    const variable = variables.find((v) => v.id === amount.variableId)
     return `${amountText} from "${variable?.name || 'Untitled'}"${inflationText}`
   }
-  if (goal.kind === 'formula') {
-    return `${amountText} (${goal.expression || 'no formula yet'})${inflationText}`
+  if (amount.kind === 'formula') {
+    return `${amountText} (${amount.expression || 'no formula yet'})${inflationText}`
   }
   return `${amountText}${inflationText}`
 }
 
-// The variable/custom/formula target-balance picker for a SavingsLine's
-// goal — structurally the same kind/value/inflation controls as
-// AmountSourceEditor, but with no frequency: a goal is a point-in-time
-// balance ("reach $X"), not a periodic amount, so there's nothing to
-// annualize. Kept as its own small component rather than sharing
-// AmountSourceEditor's implementation, since the two onChange shapes
-// (with/without frequency) don't unify without either a generic type
-// parameter or scattering `as` casts through both callers — not worth it
-// for one field's difference. Renders the "top row" controls only; pair
-// with GoalTargetFormulaRow for the formula text input on its own line.
-export function GoalTargetEditor({
-  goal,
+// The variable/custom/formula picker for a Roth conversion range's per-owner
+// amount — structurally the same as AmountSourceEditor/GoalTargetEditor, but
+// with no frequency: the amount is always a single annual figure (see
+// RothConversionAmount). Renders the "top row" controls only; pair with
+// RothConversionAmountFormulaRow for the formula text input on its own line.
+export function RothConversionAmountEditor({
+  amount,
   onChange,
   variables,
   resolvedVariableAmounts,
@@ -101,11 +95,11 @@ export function GoalTargetEditor({
   spouseBirthYear = null,
   history,
   functions,
-}: GoalTargetEditorProps) {
+}: RothConversionAmountEditorProps) {
   const formulaValue =
-    goal.kind === 'formula'
+    amount.kind === 'formula'
       ? tryEvaluateFormula(
-          goal.expression,
+          amount.expression,
           formulaScope(variables, resolvedVariableAmounts, specialYears, deathYear, selfBirthYear, spouseBirthYear),
           history,
           functions,
@@ -116,16 +110,16 @@ export function GoalTargetEditor({
     <>
       <select
         className="min-w-[8rem] flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500"
-        value={goal.kind === 'custom' ? CUSTOM_OPTION : goal.kind === 'formula' ? FORMULA_OPTION : goal.variableId}
+        value={amount.kind === 'custom' ? CUSTOM_OPTION : amount.kind === 'formula' ? FORMULA_OPTION : amount.variableId}
         onChange={(e) => {
           const value = e.target.value
-          const inflationAdjusted = goal.inflationAdjusted
+          const inflationAdjusted = amount.inflationAdjusted
           if (value === CUSTOM_OPTION) {
-            onChange(goal.kind === 'custom' ? goal : { kind: 'custom', amount: 0, inflationAdjusted })
+            onChange(amount.kind === 'custom' ? amount : { kind: 'custom', amount: 0, inflationAdjusted })
             return
           }
           if (value === FORMULA_OPTION) {
-            onChange(goal.kind === 'formula' ? goal : { kind: 'formula', expression: '', inflationAdjusted })
+            onChange(amount.kind === 'formula' ? amount : { kind: 'formula', expression: '', inflationAdjusted })
             return
           }
           onChange({ kind: 'variable', variableId: value, inflationAdjusted })
@@ -140,31 +134,31 @@ export function GoalTargetEditor({
         ))}
       </select>
 
-      {goal.kind === 'custom' && (
+      {amount.kind === 'custom' && (
         <div className="w-32">
           <CurrencyField
-            label="Target"
+            label="Amount"
             hideLabel
             min={0}
-            value={goal.amount}
-            onChange={(v) => onChange({ ...goal, amount: v })}
+            value={amount.amount}
+            onChange={(v) => onChange({ ...amount, amount: v })}
           />
         </div>
       )}
 
-      {goal.kind === 'variable' && (
+      {amount.kind === 'variable' && (
         <div
           className="flex w-32 items-center rounded-md border border-slate-200 bg-slate-50"
           title="Set above, in the variable's own amount field"
         >
           <span className="pl-3 text-slate-400 select-none">$</span>
           <span className="w-full min-w-0 px-3 py-2 text-slate-500">
-            {(resolvedVariableAmounts.get(goal.variableId) ?? 0).toLocaleString('en-US')}
+            {(resolvedVariableAmounts.get(amount.variableId) ?? 0).toLocaleString('en-US')}
           </span>
         </div>
       )}
 
-      {goal.kind === 'formula' && (
+      {amount.kind === 'formula' && (
         <div
           className="flex w-32 items-center rounded-md border border-slate-200 bg-slate-50"
           title="Computed from the formula below"
@@ -180,8 +174,8 @@ export function GoalTargetEditor({
         <input
           type="checkbox"
           className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-          checked={goal.inflationAdjusted}
-          onChange={(e) => onChange({ ...goal, inflationAdjusted: e.target.checked })}
+          checked={amount.inflationAdjusted}
+          onChange={(e) => onChange({ ...amount, inflationAdjusted: e.target.checked })}
         />
         Adjust for inflation
       </label>
@@ -190,11 +184,11 @@ export function GoalTargetEditor({
 }
 
 // The formula text input itself, rendered on its own line below the row
-// GoalTargetEditor produces — same pairing convention as
+// RothConversionAmountEditor produces — same pairing convention as
 // AmountSourceFormulaRow/AmountSourceEditor. Renders nothing for a
-// non-formula goal.
-export function GoalTargetFormulaRow({
-  goal,
+// non-formula amount.
+export function RothConversionAmountFormulaRow({
+  amount,
   onChange,
   variables,
   resolvedVariableAmounts,
@@ -204,14 +198,14 @@ export function GoalTargetFormulaRow({
   spouseBirthYear = null,
   history,
   functions,
-}: GoalTargetEditorProps) {
-  if (goal.kind !== 'formula') return null
+}: RothConversionAmountEditorProps) {
+  if (amount.kind !== 'formula') return null
   return (
     <FormulaField
       hideLabel
       hideSuccessPreview
-      expression={goal.expression}
-      onChange={(expression) => onChange({ ...goal, expression })}
+      expression={amount.expression}
+      onChange={(expression) => onChange({ ...amount, expression })}
       variables={variables}
       specialYearNames={listSpecialYearNames(specialYears)}
       extraNames={ageFormulaNames(selfBirthYear, spouseBirthYear)}

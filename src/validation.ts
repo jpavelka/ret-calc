@@ -20,3 +20,22 @@ export function findInvalidRangeIds<T extends RangeBoundsLike & { id: string }>(
   }
   return invalid
 }
+
+// For range domains where, unlike the ones above, only one range may apply
+// to a given year (e.g. dividend reinvest-vs-cash policy) — every range
+// involved in an overlap is flagged, not just the later one, so the user can
+// see both sides of the conflict.
+export function findOverlappingRangeIds<T extends RangeBoundsLike & { id: string }>(
+  ranges: T[],
+): Set<string> {
+  const overlapping = new Set<string>()
+  for (let i = 0; i < ranges.length; i++) {
+    for (let j = i + 1; j < ranges.length; j++) {
+      if (ranges[i].startYear <= ranges[j].endYear && ranges[j].startYear <= ranges[i].endYear) {
+        overlapping.add(ranges[i].id)
+        overlapping.add(ranges[j].id)
+      }
+    }
+  }
+  return overlapping
+}

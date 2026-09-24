@@ -9,12 +9,24 @@ export const CURRENT_YEAR_SPECIAL_ID = 'current-year'
 export const CURRENT_YEAR_SPECIAL_NAME = 'Current year'
 export const DEATH_YEAR_SPECIAL_ID = 'death-year'
 export const DEATH_YEAR_SPECIAL_NAME = 'Death year'
+// "Death age" — the age reached in the death year (birth year + life
+// expectancy - birth year, i.e. just life expectancy) — offered alongside
+// "Death year" in formula/condition fields. Unlike the two year-valued pseudo
+// entries above, it's not year-valued, so it's not usable as a year-boundary
+// base (no ID/resolveSpecialYearRef entry) — only listSpecialYearNames/
+// specialYearPreviewScope and runProjection's specialYearScope know about it.
+export const DEATH_AGE_SPECIAL_NAME = 'Death age'
 
 // Every special year name available to insert into a formula/condition field
-// — stored special years plus the two built-in pseudo years — for an
-// "Insert…" dropdown's "Special years" group (see FormulaField/ConditionField).
+// — stored special years plus the built-in pseudo years/ages — offered in
+// ExpressionInput's "[" quick-select (see FormulaField/ConditionField).
 export function listSpecialYearNames(specialYears: SpecialYear[]): string[] {
-  return [...specialYears.map((s) => s.name), CURRENT_YEAR_SPECIAL_NAME, DEATH_YEAR_SPECIAL_NAME]
+  return [
+    ...specialYears.map((s) => s.name),
+    CURRENT_YEAR_SPECIAL_NAME,
+    DEATH_YEAR_SPECIAL_NAME,
+    DEATH_AGE_SPECIAL_NAME,
+  ]
 }
 
 // The live-preview scope for a formula/condition field's "year" and special
@@ -23,17 +35,28 @@ export function listSpecialYearNames(specialYears: SpecialYear[]): string[] {
 // uses, rather than letting the preview scrub across years. "year" is set
 // last so it always wins even against a same-named special year (blocked
 // already by isReservedSpecialYearName, but kept consistent with
-// runProjection's own precedence regardless).
+// runProjection's own precedence regardless). "age"/"spouseAge" (today's age,
+// same convention) are added when the corresponding birth year is known —
+// see age.ts's ageFormulaNames for the matching "what's available to insert"
+// list.
 export function specialYearPreviewScope(
   specialYears: SpecialYear[],
   deathYear: number | null,
+  selfBirthYear: number | null = null,
+  spouseBirthYear: number | null = null,
 ): Record<string, number> {
   const currentYear = new Date().getFullYear()
   const scope: Record<string, number> = {}
   for (const s of specialYears) scope[s.name] = s.year
   scope[CURRENT_YEAR_SPECIAL_NAME] = currentYear
-  scope[DEATH_YEAR_SPECIAL_NAME] = deathYear ?? currentYear
+  const resolvedDeathYear = deathYear ?? currentYear
+  scope[DEATH_YEAR_SPECIAL_NAME] = resolvedDeathYear
   scope['year'] = currentYear
+  if (selfBirthYear !== null) {
+    scope['age'] = currentYear - selfBirthYear
+    scope[DEATH_AGE_SPECIAL_NAME] = resolvedDeathYear - selfBirthYear
+  }
+  if (spouseBirthYear !== null) scope['spouseAge'] = currentYear - spouseBirthYear
   return scope
 }
 
@@ -41,7 +64,8 @@ export function isReservedSpecialYearName(name: string): boolean {
   const normalized = name.trim().toLowerCase()
   return (
     normalized === CURRENT_YEAR_SPECIAL_NAME.toLowerCase() ||
-    normalized === DEATH_YEAR_SPECIAL_NAME.toLowerCase()
+    normalized === DEATH_YEAR_SPECIAL_NAME.toLowerCase() ||
+    normalized === DEATH_AGE_SPECIAL_NAME.toLowerCase()
   )
 }
 

@@ -5,7 +5,7 @@ import { savingsLineKey } from './projection'
 import type { AccountFlow, InvestmentAccountKey, YearlyRates, YearProjectionRow } from './projection'
 import { nominalReturnPct } from './simulation'
 import type { BracketBreakdownEntry } from './tax'
-import type { RetirementInputs } from './types'
+import type { DividendPolicy, RetirementInputs } from './types'
 
 interface ProjectionTableProps {
   rows: YearProjectionRow[]
@@ -201,6 +201,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
       spouse: d(row.rothConversion.spouse),
     },
     hysaInterest: d(row.hysaInterest),
+    dividendIncome: d(row.dividendIncome),
     netWorth: d(row.netWorth),
   }
 }
@@ -337,11 +338,13 @@ export function ProjectionSectionHeading() {
         text={
           'Each year: income pays taxes, then the savings plan, then expenses. ' +
           'Whatever is left over is swept into the taxable brokerage account. ' +
-          'If income falls short, the difference is drawn in a fixed order — first, that ' +
-          'year’s medical-related spending comes out of the HSA and education-related ' +
-          'spending out of the 529 (both tax-free, up to what’s available), then cash, then ' +
-          'high-yield savings, then taxable brokerage, then pre-tax, then Roth, then whatever ' +
-          'is left of the HSA, then the 529 — and the amount drawn is grossed up to cover the ' +
+          'If income falls short, the difference is drawn in the order set under Withdrawals ' +
+          '(after any required minimum distribution). Years with no withdrawal range use the ' +
+          'default order — first, that year’s medical-related spending comes out of the HSA ' +
+          'and education-related spending out of the 529 (both tax-free, up to what’s ' +
+          'available), then cash, then high-yield savings, then taxable brokerage, then ' +
+          'pre-tax, then Roth, then whatever is left of the HSA, then the 529 — and the ' +
+          'amount drawn is grossed up to cover the ' +
           'tax it triggers, since a withdrawal can itself be taxable. Selling from the taxable ' +
           'account realizes a long-term capital gain on the proportion of the balance that is ' +
           'not cost basis. Pre-tax withdrawals are ordinary income. Roth comes out basis ' +
@@ -622,8 +625,13 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   rows.push({ label: 'Federal taxable (ordinary)', amount: row.federalTaxableIncome, derived: true })
   rows.push({ label: 'Federal tax', amount: row.federalTax - row.federalCapitalGainsTax, derived: true })
   rows.push(...bracketRows('Federal', row.taxBracketBreakdown.federalOrdinary))
-  if (row.withdrawals.capitalGains > 0) {
-    rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
+  if (row.withdrawals.capitalGains > 0 || row.dividendIncome > 0) {
+    if (row.withdrawals.capitalGains > 0) {
+      rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
+    }
+    if (row.dividendIncome > 0) {
+      rows.push({ label: '+ Dividends (taxable)', amount: row.dividendIncome, section: true })
+    }
     if (unusedFederalDeduction > 0) {
       rows.push({ label: '− Federal deduction (unused portion)', amount: unusedFederalDeduction })
     }
@@ -643,8 +651,13 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   rows.push({ label: 'State taxable (ordinary)', amount: row.stateTaxableIncome, derived: true })
   rows.push({ label: 'State tax', amount: row.stateTax - row.stateCapitalGainsTax, derived: true })
   rows.push(...bracketRows('State', row.taxBracketBreakdown.stateOrdinary))
-  if (row.withdrawals.capitalGains > 0) {
-    rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
+  if (row.withdrawals.capitalGains > 0 || row.dividendIncome > 0) {
+    if (row.withdrawals.capitalGains > 0) {
+      rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
+    }
+    if (row.dividendIncome > 0) {
+      rows.push({ label: '+ Dividends (taxable)', amount: row.dividendIncome, section: true })
+    }
     if (unusedStateDeduction > 0) {
       rows.push({ label: '− State deduction (unused portion)', amount: unusedStateDeduction })
     }
@@ -679,16 +692,27 @@ function sumAccountFlows(row: YearProjectionRow): AccountFlow {
 // Contributions/withdrawals/growth/balance rows for one investment account,
 // shared by the Pre-tax/Roth/Taxable/HSA cell popovers. `basis` and
 // `basisUsed` (this year's tax-free return-of-basis portion of the
-// withdrawal, if any) only apply to Roth and Taxable.
+// withdrawal, if any) only apply to Roth and Taxable. `dividendIncome`/
+// `dividendPolicy` only apply to Taxable.
 function accountRows(
   ownerLabel: string,
   flow: AccountFlow,
   balance: number,
   basis?: number,
   basisUsed?: number,
+  dividendIncome?: number,
+  dividendPolicy?: DividendPolicy,
 ): BreakdownRow[] {
   const rows: BreakdownRow[] = [{ label: ownerLabel, amount: balance, section: true }]
-  if (flow.contributions > 0) rows.push({ label: 'Contributions', amount: flow.contributions })
+  if (flow.contributions > 0) {
+    rows.push({ label: 'Contributions', amount: flow.contributions })
+    // Reinvested dividends are folded into flow.contributions (they bought
+    // more of the account, same as a deposit) — broken out here so it's
+    // clear how much of that figure is dividends rather than new savings.
+    if (dividendIncome && dividendPolicy === 'reinvest') {
+      rows.push({ label: 'Of which dividends (reinvested)', amount: dividendIncome, sub: true })
+    }
+  }
   if (flow.withdrawals > 0) {
     rows.push({ label: 'Withdrawals', amount: flow.withdrawals })
     if (basisUsed !== undefined) {
@@ -697,6 +721,12 @@ function accountRows(
     }
   }
   rows.push({ label: 'Growth', amount: flow.growth })
+  // Dividends paid out as cash never touch this account's contributions,
+  // withdrawals, or growth — they left for the cash balance instead — so
+  // they get their own line rather than hiding inside one of those.
+  if (dividendIncome && dividendPolicy === 'cash') {
+    rows.push({ label: 'Dividends (paid out as cash)', amount: dividendIncome })
+  }
   if (basis !== undefined) rows.push({ label: 'Cost basis', amount: basis })
   return rows
 }
@@ -832,6 +862,8 @@ function StandardTable({
               row.balances.taxable,
               row.balances.taxableBasis,
               row.accountFlows.taxable.withdrawals > 0 ? row.withdrawals.taxableBasisUsed : undefined,
+              row.dividendIncome,
+              row.dividendPolicy,
             )
 
             const hsaRows = accountRows('HSA', row.accountFlows.hsa, row.balances.hsa)
@@ -974,12 +1006,6 @@ function StandardTable({
             <td className="py-1.5 pr-3 text-right">${fmt(sum(rows, (r) => r.savingsEmployeeTotal))}</td>
             <td className="py-1.5 pr-3 text-right">${fmt(sum(rows, (r) => r.savingsEmployerMatchTotal))}</td>
             <td className="py-1.5 pr-3 text-right">${fmt(sum(rows, (r) => r.totalTax))}</td>
-            <td className="py-1.5 pr-3 text-right">
-              <Money
-                value={sum(rows, (r) => r.extraTaxableSavings - (r.withdrawals.total + r.withdrawals.unfunded))}
-                highlightNegative
-              />
-            </td>
             {/* Balances aren't summed across years — only the current year's is meaningful. */}
             <td className="py-1.5 pr-3" />
             <td className="py-1.5 pr-3" />

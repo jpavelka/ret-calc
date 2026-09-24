@@ -1,5 +1,5 @@
 import { FormulaField } from './FormulaField'
-import type { FormulaHistoryContext } from './formula'
+import type { FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { HelpTooltip } from './HelpTooltip'
 import { NumberField } from './NumberField'
 import type { ResolvedVariables } from './variables'
@@ -14,6 +14,10 @@ interface VariablesEditorProps {
   // Variable's own resolution is year-independent (see resolveVariableAmounts),
   // so this is typically flatRateHistoryContext(...) rather than real history.
   history?: FormulaHistoryContext
+  // Custom functions callable from a Variable's own formula source — a
+  // Variable's formula still sees the full variable catalog (via `scope`
+  // below), unlike a custom function's own body, which sees only its params.
+  functions?: FormulaFunctionsContext
 }
 
 const CUSTOM_OPTION = 'custom'
@@ -33,6 +37,7 @@ export function VariablesEditor({
   resolvedVariables,
   bare = false,
   history,
+  functions,
 }: VariablesEditorProps) {
   function updateVariable(id: string, patch: Partial<Variable>) {
     onChange(variables.map((v) => (v.id === id ? { ...v, ...patch } : v)))
@@ -40,6 +45,15 @@ export function VariablesEditor({
 
   function removeVariable(id: string) {
     onChange(variables.filter((v) => v.id !== id))
+  }
+
+  function moveVariable(index: number, direction: -1 | 1) {
+    const target = index + direction
+    if (target < 0 || target >= variables.length) return
+    const next = [...variables]
+    const [moved] = next.splice(index, 1)
+    next.splice(target, 0, moved)
+    onChange(next)
   }
 
   function addVariable() {
@@ -73,12 +87,34 @@ export function VariablesEditor({
       )}
 
       <div className="mt-3 flex flex-col gap-2">
-        {variables.map((v) => (
+        {variables.map((v, index) => (
           <div
             key={v.id}
             className="flex flex-col gap-2 rounded-md border border-slate-200 p-2"
           >
             <div className="flex flex-wrap items-center gap-2">
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => moveVariable(index, -1)}
+                  disabled={index === 0}
+                  aria-label="Move up"
+                  title="Move up"
+                  className="rounded-md border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  onClick={() => moveVariable(index, 1)}
+                  disabled={index === variables.length - 1}
+                  aria-label="Move down"
+                  title="Move down"
+                  className="rounded-md border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  ↓
+                </button>
+              </div>
               <input
                 type="text"
                 placeholder="e.g. Base salary"
@@ -143,6 +179,7 @@ export function VariablesEditor({
                 variables={variables.filter((other) => other.id !== v.id)}
                 scope={scope}
                 history={history}
+                functions={functions}
                 overrideError={resolvedVariables.errors.get(v.id)}
               />
             )}

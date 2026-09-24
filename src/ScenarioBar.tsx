@@ -10,6 +10,7 @@ interface ScenarioBarProps {
   onLoad: (name: string) => void
   onSave: () => void
   onSaveAs: (name: string) => void
+  onReload: () => void
   onDelete: () => void
 }
 
@@ -22,6 +23,7 @@ export function ScenarioBar({
   onLoad,
   onSave,
   onSaveAs,
+  onReload,
   onDelete,
 }: ScenarioBarProps) {
   const [newName, setNewName] = useState('')
@@ -75,6 +77,14 @@ export function ScenarioBar({
             className="rounded-md bg-emerald-600 px-4 py-2 font-medium text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
           >
             Save
+          </button>
+          <button
+            type="button"
+            onClick={onReload}
+            disabled={busy || !activeScenario}
+            className="rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            Reload
           </button>
           <button
             type="button"
