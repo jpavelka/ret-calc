@@ -28,6 +28,9 @@ export interface BracketBreakdownEntry {
   // Dollars taxed at this rate within [rangeStart, rangeEnd).
   amount: number
   tax: number
+  // Rate of the next bracket up, if any — set only on the last entry, so a
+  // display can show how much room remains before crossing into it.
+  nextRatePct?: number
 }
 
 // Per-bracket detail for the dollars in [rangeStart, rangeEnd) against
@@ -62,6 +65,11 @@ export function bracketBreakdown(
       amount,
       tax: amount * (sorted[i].ratePct / 100),
     })
+  }
+  const last = entries[entries.length - 1]
+  if (last && last.max !== null) {
+    const next = sorted.find((b) => b.min === last.max)
+    if (next) last.nextRatePct = next.ratePct
   }
   return entries
 }
@@ -151,7 +159,7 @@ export interface IncomeTaxResult {
   // federalTaxableIncome above (includes any taxable Social Security).
   // Display-only. State AGI can differ (see stateTaxableIncome) whenever
   // taxableSocialSecurity's federal/state figures themselves differ.
-  ordinaryAgi: number
+  adjustedOrdinary: number
 }
 
 // Tax for one jurisdiction's schedule. Capital gains stack on top of ordinary
@@ -164,17 +172,17 @@ export interface IncomeTaxResult {
 // little ordinary income funded by brokerage sales, where treating the gains
 // as if they started at dollar zero would overtax them.
 function scheduleTax(
-  ordinaryAgi: number,
+  adjustedOrdinary: number,
   capitalGains: number,
   deduction: number,
   ordinaryBrackets: TaxBracket[],
   capitalGainsBrackets: TaxBracket[] | null,
 ): { ordinary: number; ordinaryTaxable: number; capitalGains: number; capitalGainsTaxable: number } {
-  const ordinaryTaxable = Math.max(0, ordinaryAgi - deduction)
+  const ordinaryTaxable = Math.max(0, adjustedOrdinary - deduction)
   const ordinary = bracketTaxSorted(ordinaryTaxable, ordinaryBrackets)
   if (capitalGains <= 0) return { ordinary, ordinaryTaxable, capitalGains: 0, capitalGainsTaxable: 0 }
 
-  const unusedDeduction = Math.max(0, deduction - ordinaryAgi)
+  const unusedDeduction = Math.max(0, deduction - adjustedOrdinary)
   const gainsTaxable = Math.max(0, capitalGains - unusedDeduction)
   // When the jurisdiction has no separate gains schedule, stacking against the
   // ordinary schedule is exactly "gains taxed as ordinary income".
@@ -251,6 +259,6 @@ export function computeIncomeTaxes(
     federalTaxableGains: federal.capitalGainsTaxable,
     stateTaxableIncome: state.ordinaryTaxable,
     stateTaxableGains: state.capitalGainsTaxable,
-    ordinaryAgi: federalAgi,
+    adjustedOrdinary: federalAgi,
   }
 }

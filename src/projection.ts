@@ -101,7 +101,7 @@ export interface YearProjectionRow {
   // AGI subject to ordinary rates, before either jurisdiction's own
   // deduction — the shared input behind federalTaxableIncome and
   // stateTaxableIncome below. Display-only.
-  ordinaryAgi: number
+  adjustedOrdinary: number
   // The deductions federalTaxableIncome/stateTaxableIncome below were
   // computed net of. Federal has no separate personal-exemption concept in
   // this model, so its whole deduction is the standard deduction; state
@@ -153,12 +153,17 @@ export interface YearProjectionRow {
   // income) it never appears in incomeBySource. taxableFederal/taxableState
   // are the portion of `total` the provisional-income test counted as
   // taxable this year — already folded into federalTax/stateTax above.
+  // otherAGI is that test's own income figure — every other income source
+  // (including capital gains/dividends, excluding Social Security itself) —
+  // display-only, so a breakdown can show the provisional-income math that
+  // produced taxableFederal/taxableState rather than just their result.
   socialSecurity: {
     self: number
     spouse: number
     total: number
     taxableFederal: number
     taxableState: number
+    otherAGI: number
   }
 
   // Whatever came in this year — income plus any withdrawal, RMDs included —
@@ -207,7 +212,7 @@ export interface YearProjectionRow {
 
   // This year's high-yield savings interest — computed off the balance the
   // account opened the year with (see runProjection) and already folded into
-  // ordinaryAgi/federalTax/stateTax above, same as wage income. Broken out
+  // adjustedOrdinary/federalTax/stateTax above, same as wage income. Broken out
   // here purely for display, the same role rothConversion plays for taxes.
   hysaInterest: number
 
@@ -1245,6 +1250,12 @@ export function runProjection(
     const expenseNameByKey = new Map<string, string>()
     const expenseEducationByKey = new Map<string, boolean>()
     const expenseMedicalByKey = new Map<string, boolean>()
+    // Sum of this year's spending lines flagged preTax (see
+    // SpendingAllocation.preTax) — still counted normally in expenseByBucket/
+    // expenseTotal below (real spending, funded like any other expense), but
+    // also subtracted from baseOrdinary/payrollWages further down, since that
+    // amount was never part of taxable/FICA wages to begin with.
+    let preTaxSpendingTotal = 0
     for (const range of activeRanges(inputs.spendingRanges, year)) {
       for (const alloc of range.allocations) {
         const resolved = resolveAllocation(alloc, variablesById, resolvedVariableAmounts, yearScope, historyContext, functionsContext)
@@ -1260,6 +1271,7 @@ export function runProjection(
           resolved.key,
           (expenseMedicalByKey.get(resolved.key) ?? false) || (alloc.medicalRelated ?? false),
         )
+        if (alloc.preTax) preTaxSpendingTotal += grown
       }
     }
     const expenseTotal = sumValues(expenseByBucketMap)
@@ -1465,8 +1477,10 @@ export function runProjection(
     // FICA is driven by wages alone, so it doesn't change as the solver below
     // varies withdrawals. Computing it out here keeps "withdrawals are never
     // subject to FICA" a structural property rather than something a later
-    // edit could quietly break.
-    const payrollWages = Math.max(0, incomeTotal - hsaContributions)
+    // edit could quietly break. preTaxSpendingTotal (e.g. Section 125 health
+    // premiums) is excluded from FICA wages same as an HSA contribution —
+    // see SpendingAllocation.preTax.
+    const payrollWages = Math.max(0, incomeTotal - hsaContributions - preTaxSpendingTotal)
     const socialSecurityTax =
       Math.min(payrollWages, inputs.socialSecurityWageBase) *
       (inputs.socialSecurityTaxRatePct / 100)
@@ -1494,11 +1508,20 @@ export function runProjection(
     // after-tax money). A Roth conversion adds ordinary income the same way a
     // pre-tax withdrawal would. HYSA interest is ordinary income too, like a
     // 1099-INT, and — unlike every other account's growth — taxed the year
-    // it's earned rather than deferred to withdrawal. Left unclamped here so
-    // the clamp happens once, after withdrawal income is added — clamping
-    // first would overstate AGI in a year where contributions exceed income.
+    // it's earned rather than deferred to withdrawal. preTaxSpendingTotal
+    // (e.g. Section 125 health premiums, see SpendingAllocation.preTax)
+    // reduces it the same way a pre-tax deferral does, even though it's still
+    // counted in expenseTotal/committed below — real spending, just never
+    // part of taxable wages to start with. Left unclamped here so the clamp
+    // happens once, after withdrawal income is added — clamping first would
+    // overstate AGI in a year where contributions exceed income.
     const baseOrdinary =
-      incomeTotal - preTaxDeferrals - hsaContributions + rothConversionTotal + hysaInterest
+      incomeTotal -
+      preTaxDeferrals -
+      hsaContributions -
+      preTaxSpendingTotal +
+      rothConversionTotal +
+      hysaInterest
     const committed = expenseTotal + savingsEmployeeTotal
     // Snapshot after contributions and the conversion are posted but before
     // any withdrawal, so every solver pass draws against the same starting
@@ -1536,7 +1559,7 @@ export function runProjection(
       const otherAGI = baseOrdinary + plan.ordinaryIncome + plan.capitalGains + dividendIncome
       const federal = taxableSocialSecurityBenefit(ssBenefitTotal, otherAGI, 0, ssThresholds)
       const state = inputs.socialSecurity.stateTaxesSocialSecurity ? federal : 0
-      return { federal, state }
+      return { federal, state, otherAGI }
     }
 
     let need = Math.max(
@@ -1789,7 +1812,7 @@ export function runProjection(
       savingsByLine,
       preTaxSavingsDeferrals: preTaxDeferrals,
       hsaSavingsContributions: hsaContributions,
-      ordinaryAgi: incomeTax.ordinaryAgi,
+      adjustedOrdinary: incomeTax.adjustedOrdinary,
       taxDeductions,
       federalTax,
       federalCapitalGainsTax: incomeTax.federalCapitalGains,
@@ -1811,6 +1834,7 @@ export function runProjection(
         total: ssBenefitTotal,
         taxableFederal: ssTaxable.federal,
         taxableState: ssTaxable.state,
+        otherAGI: ssTaxable.otherAGI,
       },
       extraTaxableSavings,
       withdrawals: {

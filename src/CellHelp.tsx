@@ -29,7 +29,17 @@ interface Position {
 // Unlike HelpTooltip, the panel must also track the button across
 // scroll/resize while open, and close itself if the button scrolls out of
 // view or behind the sticky columns.
-export function CellHelp({ label, children }: { label: string; children: ReactNode }) {
+export function CellHelp({
+  label,
+  children,
+  width = PANEL_WIDTH,
+}: {
+  label: string
+  children: ReactNode
+  // Wider than the default for popups with denser content (e.g. the full
+  // Taxes breakdown), which otherwise wrap awkwardly at PANEL_WIDTH.
+  width?: number
+}) {
   const detailsRef = useRef<HTMLDetailsElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)
@@ -45,11 +55,11 @@ export function CellHelp({ label, children }: { label: string; children: ReactNo
     }
     const openUp = rect.top > window.innerHeight * 0.6
     setPos({
-      left: Math.min(Math.max(8, rect.left), window.innerWidth - PANEL_WIDTH - 8),
+      left: Math.min(Math.max(8, rect.left), window.innerWidth - width - 8),
       offset: openUp ? window.innerHeight - rect.top + 4 : rect.bottom + 4,
       openUp,
     })
-  }, [])
+  }, [width])
 
   useEffect(() => {
     const el = detailsRef.current
@@ -110,7 +120,7 @@ export function CellHelp({ label, children }: { label: string; children: ReactNo
             style={{
               position: 'fixed',
               left: pos.left,
-              width: PANEL_WIDTH,
+              width,
               ...(pos.openUp ? { bottom: pos.offset } : { top: pos.offset }),
             }}
             className="z-50 max-h-[60vh] overflow-auto rounded-md border border-slate-200 bg-white p-2 text-xs font-normal leading-snug text-slate-600 shadow-md"

@@ -117,7 +117,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
     })),
     preTaxSavingsDeferrals: d(row.preTaxSavingsDeferrals),
     hsaSavingsContributions: d(row.hsaSavingsContributions),
-    ordinaryAgi: d(row.ordinaryAgi),
+    adjustedOrdinary: d(row.adjustedOrdinary),
     taxDeductions: {
       federalStandardDeduction: d(row.taxDeductions.federalStandardDeduction),
       stateStandardDeduction: d(row.taxDeductions.stateStandardDeduction),
@@ -149,6 +149,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
       total: d(row.socialSecurity.total),
       taxableFederal: d(row.socialSecurity.taxableFederal),
       taxableState: d(row.socialSecurity.taxableState),
+      otherAGI: d(row.socialSecurity.otherAGI),
     },
     extraTaxableSavings: d(row.extraTaxableSavings),
     withdrawals: {
@@ -322,7 +323,16 @@ export function ProjectionTable({ rows, inputs, rates }: ProjectionTableProps) {
           <BasicTable rows={displayRows} spouseEnabled={inputs.spouseEnabled} rates={rates} />
         )}
         {level === 'standard' && (
-          <StandardTable rows={displayRows} spouseEnabled={inputs.spouseEnabled} rates={rates} />
+          <StandardTable
+            rows={displayRows}
+            spouseEnabled={inputs.spouseEnabled}
+            rates={rates}
+            ssThresholds={
+              inputs.spouseEnabled
+                ? inputs.socialSecurity.provisionalIncomeThresholds.marriedFilingJointly
+                : inputs.socialSecurity.provisionalIncomeThresholds.single
+            }
+          />
         )}
         {level === 'detailed' && <DetailedTable rows={displayRows} inputs={inputs} rates={rates} />}
       </div>
@@ -512,7 +522,8 @@ function BasicTable({
 
 interface BreakdownRow {
   label: string
-  amount: number
+  // Omitted for a `header` row, which carries no figure of its own.
+  amount?: number
   // A computed step rather than an input, e.g. "→ Federal tax" — rendered
   // italic/muted with an arrow.
   derived?: boolean
@@ -523,6 +534,13 @@ interface BreakdownRow {
   section?: boolean
   // Rose/red — e.g. "Unfunded".
   warn?: boolean
+  // A bold, amount-less section title, e.g. "Federal" / "State" — a stronger
+  // break than `section` for grouping a whole jurisdiction's derivation.
+  header?: boolean
+  // A lighter amount-less title one level below `header`, e.g. "Income" /
+  // "Capital gains" — separates the two bracket schedules within a single
+  // jurisdiction's section.
+  subHeader?: boolean
 }
 
 function BreakdownList({ rows, empty = 'None' }: { rows: BreakdownRow[]; empty?: string }) {
@@ -536,137 +554,253 @@ function BreakdownList({ rows, empty = 'None' }: { rows: BreakdownRow[]; empty?:
             'flex justify-between gap-4',
             r.derived || r.sub ? 'italic' : '',
             r.sub ? 'pl-3' : '',
-            r.section ? 'mt-1 border-t border-slate-200 pt-1' : '',
+            r.section || r.header ? 'mt-1 border-t border-slate-200 pt-1' : '',
+            r.header ? 'mt-2.5' : '',
+            r.subHeader ? 'mt-1.5' : '',
           ]
             .filter(Boolean)
             .join(' ')}
         >
-          <span className={r.warn ? 'text-rose-500' : r.derived || r.sub ? 'text-slate-400' : 'text-slate-500'}>
+          <span
+            className={
+              r.header
+                ? 'font-semibold uppercase tracking-wide text-slate-700'
+                : r.subHeader
+                  ? 'font-semibold uppercase tracking-wide text-[10px] text-slate-400'
+                  : r.warn
+                    ? 'text-rose-500'
+                    : r.derived || r.sub
+                      ? 'text-slate-400'
+                      : 'text-slate-500'
+            }
+          >
             {r.derived ? `→ ${r.label}` : r.label}
           </span>
-          <span className={r.warn ? 'text-rose-600' : r.derived || r.sub ? 'text-slate-500' : 'text-slate-700'}>
-            {r.amount < 0 ? '-' : ''}${fmt(Math.abs(r.amount))}
-          </span>
+          {r.amount !== undefined && (
+            <span className={r.warn ? 'text-rose-600' : r.derived || r.sub ? 'text-slate-500' : 'text-slate-700'}>
+              {r.amount < 0 ? '-' : ''}${fmt(Math.abs(r.amount))}
+            </span>
+          )}
         </li>
       ))}
     </ul>
   )
 }
 
-function bracketRows(label: string, entries: BracketBreakdownEntry[]): BreakdownRow[] {
-  return entries
+// No jurisdiction/kind prefix on the label — the caller places these under a
+// "Federal"/"State" header and an "Income"/"Capital gains" subHeader, so the
+// bracket line itself only needs the rate and the dollars taxed at it.
+function bracketRows(entries: BracketBreakdownEntry[]): BreakdownRow[] {
+  const rows: BreakdownRow[] = entries
     .filter((b) => b.amount > 0)
     .map((b) => ({
-      label: `${label}: ${b.ratePct}% of $${fmt(b.amount)}`,
+      label: `${b.ratePct}% of $${fmt(b.amount)}`,
       amount: b.tax,
       sub: true,
     }))
+  const last = entries[entries.length - 1]
+  if (last && last.max !== null && last.nextRatePct !== undefined) {
+    const room = last.max - (last.min + last.amount)
+    if (room > 0) {
+      rows.push({ label: `$${fmt(room)} until ${last.nextRatePct}% bracket`, derived: true, sub: true })
+    }
+  }
+  return rows
 }
 
-// The full income → AGI → deduction → taxable base → tax-by-bracket
-// derivation, per jurisdiction, plus payroll tax and any penalty. Same steps
-// the old hand-rolled Taxes panel walked through, now as BreakdownList rows
-// with the standard deduction/exemption and per-bracket amounts (previously
-// nowhere in the UI) made explicit. AGI and capital gains realized are the
-// same inputs to both jurisdictions' calculations (see tax.ts's
-// computeIncomeTaxes), so each is repeated once per jurisdiction section
-// rather than shown only once up top — deductions differ per jurisdiction,
-// so the reader needs both restated to follow either derivation on its own.
+// Opens with a flat accounting of every income source, gross, split into
+// Ordinary income vs. Capital gains & dividends (wages/salary and other
+// income lines from incomeBySource, Social Security, Roth conversions,
+// RMDs, other pre-tax distributions, early Roth/HSA/529 withdrawals, HYSA
+// interest, dividends, and realized capital gains) — rather than one lump
+// 'Income' figure, since the point of this popup is to show what actually
+// goes into the number next to it. Then walks income sources → AGI → MAGI
+// → deduction → taxable base → tax-by-bracket, in clearly separated Federal
+// and State sections, plus payroll tax and any penalty — reusing the totals
+// from the opening accounting rather than re-listing each source.
+//
+// The displayed AGI is simply total income (all sources) less total
+// adjustments — this lines up with row.adjustedOrdinary + capital gains/dividends
+// (the true 1040-style figure) because row.adjustedOrdinary itself excludes
+// capital gains/dividends, which are taxed separately via a stacked bracket
+// schedule (see tax.ts's scheduleTax), and its own adjustments are exactly
+// pre-tax contributions, HSA contributions, and the non-taxable share of
+// Social Security. MAGI (as used for IRMAA/ACA/Roth-eligibility purposes)
+// adds that untaxed Social Security share back on top of AGI. Federal and
+// state AGI can differ only in how much of Social Security each one taxes
+// (most states don't tax it at all), so State restates its own AGI from
+// row.socialSecurity.taxableState rather than reusing the federal figure.
 function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
+  const rmdTotal = row.withdrawals.rmd.self + row.withdrawals.rmd.spouse
   const preTaxDistributions =
     row.withdrawals.ordinaryIncomeByAccount.preTaxSelf + row.withdrawals.ordinaryIncomeByAccount.preTaxSpouse
+  const otherPreTaxDistributions = Math.max(0, preTaxDistributions - rmdTotal)
   const rothEarlyWithdrawals =
     row.withdrawals.ordinaryIncomeByAccount.rothSelf + row.withdrawals.ordinaryIncomeByAccount.rothSpouse
   const hsaNonQualifiedWithdrawals = row.withdrawals.ordinaryIncomeByAccount.hsa
   const college529NonQualifiedWithdrawals = row.withdrawals.ordinaryIncomeByAccount.college529
+  const totalCapitalGains = row.withdrawals.capitalGains + row.dividendIncome
+  const nonTaxableSocialSecurityFederal = row.socialSecurity.total - row.socialSecurity.taxableFederal
 
-  const rows: BreakdownRow[] = [{ label: 'Income', amount: row.incomeTotal }]
+  const rows: BreakdownRow[] = []
+
+  // A flat "here's everything, categorized" summary before the AGI/deduction
+  // walk below — gross amounts as actually received, so e.g. Social Security
+  // shows its full benefit rather than just the taxable portion, and wages
+  // aren't net of the pre-tax deferrals subtracted further down.
+  rows.push({ label: 'All income sources', header: true })
+  rows.push({ label: 'Ordinary income', subHeader: true })
+  for (const source of row.incomeBySource) {
+    if (source.amount !== 0) rows.push({ label: source.name, amount: source.amount })
+  }
+  if (row.socialSecurity.total > 0) {
+    rows.push({ label: 'Social Security benefit', amount: row.socialSecurity.total })
+  }
+  if (row.rothConversion.total > 0) {
+    rows.push({ label: 'Roth conversion', amount: row.rothConversion.total })
+  }
+  if (row.hysaInterest > 0) {
+    rows.push({ label: 'HYSA interest', amount: row.hysaInterest })
+  }
+  if (rmdTotal > 0) {
+    rows.push({ label: 'Required minimum distribution', amount: rmdTotal })
+  }
+  if (otherPreTaxDistributions > 0) {
+    rows.push({ label: 'Other pre-tax distributions', amount: otherPreTaxDistributions })
+  }
+  if (rothEarlyWithdrawals > 0) {
+    rows.push({ label: 'Roth early withdrawals', amount: rothEarlyWithdrawals })
+  }
+  if (hsaNonQualifiedWithdrawals > 0) {
+    rows.push({ label: 'HSA non-qualified withdrawals', amount: hsaNonQualifiedWithdrawals })
+  }
+  if (college529NonQualifiedWithdrawals > 0) {
+    rows.push({ label: '529 non-qualified withdrawals', amount: college529NonQualifiedWithdrawals })
+  }
+  const totalOrdinaryIncomeSources =
+    row.incomeTotal +
+    row.socialSecurity.total +
+    row.rothConversion.total +
+    row.hysaInterest +
+    rmdTotal +
+    otherPreTaxDistributions +
+    rothEarlyWithdrawals +
+    hsaNonQualifiedWithdrawals +
+    college529NonQualifiedWithdrawals
+  rows.push({ label: 'Total ordinary income', amount: totalOrdinaryIncomeSources, derived: true })
+  if (totalCapitalGains > 0) {
+    rows.push({ label: 'Capital gains & dividends', subHeader: true })
+    if (row.withdrawals.capitalGains > 0) {
+      rows.push({ label: 'Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains })
+    }
+    if (row.dividendIncome > 0) {
+      rows.push({ label: 'Dividends', amount: row.dividendIncome })
+    }
+    rows.push({ label: 'Total capital gains & dividends', amount: totalCapitalGains, derived: true })
+  }
+  
+  rows.push({ label: 'Adjustments to income', subHeader: true })
   if (row.preTaxSavingsDeferrals > 0) {
-    rows.push({ label: '− Pre-tax savings', amount: row.preTaxSavingsDeferrals })
+    rows.push({ label: '− Pre-tax contributions', amount: row.preTaxSavingsDeferrals })
   }
   if (row.hsaSavingsContributions > 0) {
     rows.push({ label: '− HSA contributions', amount: row.hsaSavingsContributions })
   }
-  if (row.rothConversion.total > 0) {
-    rows.push({ label: '+ Roth conversion', amount: row.rothConversion.total })
+  if (nonTaxableSocialSecurityFederal > 0) {
+    rows.push({ label: '− Non-taxable Social Security', amount: nonTaxableSocialSecurityFederal })
   }
-  if (row.hysaInterest > 0) {
-    rows.push({ label: '+ HYSA interest', amount: row.hysaInterest })
+  const totalAdjustments = nonTaxableSocialSecurityFederal + row.hsaSavingsContributions + row.preTaxSavingsDeferrals
+  rows.push({ label: 'Total adjustments', amount: totalAdjustments, derived: true })
+  const totalIncomeAllSources = totalOrdinaryIncomeSources + totalCapitalGains
+  rows.push({
+    label: 'Total income (all sources)',
+    amount: totalIncomeAllSources,
+    derived: true,
+    section: true,
+  })
+  rows.push({
+    label: 'Adjusted ordinary',
+    amount: row.adjustedOrdinary,
+    derived: true,
+  })
+
+  rows.push({
+    label: 'Adjusted gross income (AGI)',
+    amount: totalIncomeAllSources - totalAdjustments,
+    derived: true,
+    section: true,
+  })
+  if (nonTaxableSocialSecurityFederal > 0) {
+    rows.push({ label: '+ Non-taxable Social Security', amount: nonTaxableSocialSecurityFederal })
   }
-  if (preTaxDistributions > 0) {
-    rows.push({ label: '+ Pre-tax distributions', amount: preTaxDistributions })
-  }
-  if (rothEarlyWithdrawals > 0) {
-    rows.push({ label: '+ Roth early withdrawals', amount: rothEarlyWithdrawals })
-  }
-  if (hsaNonQualifiedWithdrawals > 0) {
-    rows.push({ label: '+ HSA non-qualified withdrawals', amount: hsaNonQualifiedWithdrawals })
-  }
-  if (college529NonQualifiedWithdrawals > 0) {
-    rows.push({ label: '+ 529 non-qualified withdrawals', amount: college529NonQualifiedWithdrawals })
-  }
-  rows.push({ label: 'Adjusted gross income (ordinary)', amount: row.ordinaryAgi, derived: true, section: true })
+  rows.push({
+    label: 'Modified AGI (MAGI)',
+    amount: totalIncomeAllSources - totalAdjustments + nonTaxableSocialSecurityFederal,
+    derived: true,
+  })
 
   // The standard deduction absorbs ordinary AGI first and spills onto gains
   // (see tax.ts's scheduleTax) — whatever's left over after that is what
   // actually reduces this year's taxable capital gains.
-  const unusedFederalDeduction = Math.max(0, row.taxDeductions.federalStandardDeduction - row.ordinaryAgi)
+  const unusedFederalDeduction = Math.max(0, row.taxDeductions.federalStandardDeduction - row.adjustedOrdinary)
+
+  rows.push({ label: 'Federal', header: true })
+  rows.push({ label: 'Income', subHeader: true })
+  rows.push({ label: 'Adjusted ordinary', amount: row.adjustedOrdinary, derived: true })
+  rows.push({ label: '− Standard deduction', amount: row.taxDeductions.federalStandardDeduction })
+  rows.push({ label: 'Taxable amount', amount: row.federalTaxableIncome, derived: true })
+  rows.push({ label: 'Tax', amount: row.federalTax - row.federalCapitalGainsTax, derived: true })
+  rows.push(...bracketRows(row.taxBracketBreakdown.federalOrdinary))
+  if (totalCapitalGains > 0) {
+    rows.push({ label: 'Capital gains', subHeader: true })
+    rows.push({ label: 'Capital gains & dividends', amount: totalCapitalGains, derived: true })
+    if (unusedFederalDeduction > 0) {
+      rows.push({ label: '− Deduction (unused portion)', amount: unusedFederalDeduction })
+    }
+    rows.push({ label: 'Taxable amount', amount: row.federalTaxableGains, derived: true })
+    rows.push({ label: 'Tax', amount: row.federalCapitalGainsTax, derived: true })
+    rows.push(...bracketRows(row.taxBracketBreakdown.federalGains))
+  }
+  rows.push({ label: 'Federal tax (total)', amount: row.federalTax, derived: true, section: true })
+
+  // State AGI restates from row.socialSecurity.taxableState rather than
+  // reusing the federal figure above — the two differ whenever the state
+  // taxes Social Security differently than the federal test does (most
+  // states don't tax it at all).
+  const stateAgi = row.adjustedOrdinary - row.socialSecurity.taxableFederal + row.socialSecurity.taxableState
   const stateDeductionTotal =
     row.taxDeductions.stateStandardDeduction +
     row.taxDeductions.statePersonalExemption +
     row.taxDeductions.stateContributionDeduction
-  const unusedStateDeduction = Math.max(0, stateDeductionTotal - row.ordinaryAgi)
+  const unusedStateDeduction = Math.max(0, stateDeductionTotal - stateAgi)
 
-  rows.push({
-    label: '− Federal standard deduction',
-    amount: row.taxDeductions.federalStandardDeduction,
-    section: true,
-  })
-  rows.push({ label: 'Federal taxable (ordinary)', amount: row.federalTaxableIncome, derived: true })
-  rows.push({ label: 'Federal tax', amount: row.federalTax - row.federalCapitalGainsTax, derived: true })
-  rows.push(...bracketRows('Federal', row.taxBracketBreakdown.federalOrdinary))
-  if (row.withdrawals.capitalGains > 0 || row.dividendIncome > 0) {
-    if (row.withdrawals.capitalGains > 0) {
-      rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
-    }
-    if (row.dividendIncome > 0) {
-      rows.push({ label: '+ Dividends (taxable)', amount: row.dividendIncome, section: true })
-    }
-    if (unusedFederalDeduction > 0) {
-      rows.push({ label: '− Federal deduction (unused portion)', amount: unusedFederalDeduction })
-    }
-    rows.push({ label: 'Federal taxable (cap. gains)', amount: row.federalTaxableGains, derived: true })
-    rows.push({ label: 'Federal gains tax', amount: row.federalCapitalGainsTax, derived: true })
-    rows.push(...bracketRows('Fed. gains', row.taxBracketBreakdown.federalGains))
-  }
-
-  rows.push({ label: 'Adjusted gross income (ordinary)', amount: row.ordinaryAgi, section: true })
-  rows.push({ label: '− State standard deduction', amount: row.taxDeductions.stateStandardDeduction })
+  rows.push({ label: 'State', header: true })
+  rows.push({ label: 'Income', subHeader: true })
+  rows.push({ label: 'Ordinary income', amount: stateAgi, derived: true })
+  rows.push({ label: '− Standard deduction', amount: row.taxDeductions.stateStandardDeduction })
   if (row.taxDeductions.statePersonalExemption > 0) {
-    rows.push({ label: '− State personal exemption', amount: row.taxDeductions.statePersonalExemption })
+    rows.push({ label: '− Personal exemption', amount: row.taxDeductions.statePersonalExemption })
   }
   if (row.taxDeductions.stateContributionDeduction > 0) {
-    rows.push({ label: '− State 529 contribution deduction', amount: row.taxDeductions.stateContributionDeduction })
+    rows.push({ label: '− 529 contribution deduction', amount: row.taxDeductions.stateContributionDeduction })
   }
-  rows.push({ label: 'State taxable (ordinary)', amount: row.stateTaxableIncome, derived: true })
-  rows.push({ label: 'State tax', amount: row.stateTax - row.stateCapitalGainsTax, derived: true })
-  rows.push(...bracketRows('State', row.taxBracketBreakdown.stateOrdinary))
-  if (row.withdrawals.capitalGains > 0 || row.dividendIncome > 0) {
-    if (row.withdrawals.capitalGains > 0) {
-      rows.push({ label: '+ Capital gains (brokerage sale)', amount: row.withdrawals.capitalGains, section: true })
-    }
-    if (row.dividendIncome > 0) {
-      rows.push({ label: '+ Dividends (taxable)', amount: row.dividendIncome, section: true })
-    }
+  rows.push({ label: 'Taxable amount', amount: row.stateTaxableIncome, derived: true })
+  rows.push({ label: 'Tax', amount: row.stateTax - row.stateCapitalGainsTax, derived: true })
+  rows.push(...bracketRows(row.taxBracketBreakdown.stateOrdinary))
+  if (totalCapitalGains > 0) {
+    rows.push({ label: 'Capital gains', subHeader: true })
+    rows.push({ label: 'Capital gains & dividends', amount: totalCapitalGains, derived: true })
     if (unusedStateDeduction > 0) {
-      rows.push({ label: '− State deduction (unused portion)', amount: unusedStateDeduction })
+      rows.push({ label: '− Deduction (unused portion)', amount: unusedStateDeduction })
     }
-    rows.push({ label: 'State taxable (cap. gains)', amount: row.stateTaxableGains, derived: true })
-    rows.push({ label: 'State gains tax', amount: row.stateCapitalGainsTax, derived: true })
-    rows.push(...bracketRows('St. gains', row.taxBracketBreakdown.stateGains))
+    rows.push({ label: 'Taxable amount', amount: row.stateTaxableGains, derived: true })
+    rows.push({ label: 'Tax', amount: row.stateCapitalGainsTax, derived: true })
+    rows.push(...bracketRows(row.taxBracketBreakdown.stateGains))
   }
+  rows.push({ label: 'State tax (total)', amount: row.stateTax, derived: true, section: true })
 
-  rows.push({ label: 'Social Security', amount: row.socialSecurityTax, section: true })
+  rows.push({ label: 'Payroll & other', header: true })
+  rows.push({ label: 'Social Security (FICA)', amount: row.socialSecurityTax })
   rows.push({ label: 'Medicare', amount: row.medicareTax + row.additionalMedicareTax })
   if (row.earlyWithdrawalPenalty > 0) {
     rows.push({ label: 'Early withdrawal penalty', amount: row.earlyWithdrawalPenalty })
@@ -761,18 +895,23 @@ function ValueCell({
   value,
   label,
   bold,
+  width,
   children,
 }: {
   value: ReactNode
   label: string
   bold?: boolean
+  // Wider popup for cells with denser content, e.g. the full Taxes breakdown.
+  width?: number
   children: ReactNode
 }) {
   return (
     <td className={`py-1.5 pr-3 text-right ${bold ? 'font-medium text-slate-900' : 'text-slate-700'}`}>
       <span className="inline-flex items-center justify-end gap-1">
         {value}
-        <CellHelp label={label}>{children}</CellHelp>
+        <CellHelp label={label} width={width}>
+          {children}
+        </CellHelp>
       </span>
     </td>
   )
@@ -782,10 +921,14 @@ function StandardTable({
   rows,
   spouseEnabled,
   rates,
+  ssThresholds,
 }: {
   rows: YearProjectionRow[]
   spouseEnabled: boolean
   rates?: YearlyRates[]
+  // Provisional-income thresholds for the Social Security breakdown popup —
+  // already resolved to single vs. married-filing-jointly by the caller.
+  ssThresholds: { lower: number; upper: number }
 }) {
   return (
     <div className="max-h-[32rem] overflow-auto">
@@ -926,11 +1069,39 @@ function StandardTable({
                             { label: 'Spouse', amount: row.socialSecurity.spouse },
                           ]
                         : []),
+                      ...(row.socialSecurity.total > 0
+                        ? [
+                            { label: 'Provisional income test', subHeader: true, section: spouseEnabled },
+                            { label: 'Other income (AGI)', amount: row.socialSecurity.otherAGI },
+                            { label: '+ 50% of benefit', amount: row.socialSecurity.total / 2 },
+                            {
+                              label: 'Provisional income',
+                              amount: row.socialSecurity.otherAGI + row.socialSecurity.total / 2,
+                              derived: true,
+                            },
+                            { label: `Below $${fmt(ssThresholds.lower)}: none taxable`, sub: true },
+                            {
+                              label: `$${fmt(ssThresholds.lower)}–$${fmt(ssThresholds.upper)}: up to 50% taxable`,
+                              sub: true,
+                            },
+                            { label: `Above $${fmt(ssThresholds.upper)}: up to 85% taxable`, sub: true },
+                          ]
+                        : []),
                       {
                         label: 'Taxable (federal)',
                         amount: row.socialSecurity.taxableFederal,
-                        section: spouseEnabled,
+                        derived: row.socialSecurity.total > 0,
+                        section: spouseEnabled && row.socialSecurity.total <= 0,
                       },
+                      ...(row.socialSecurity.total > 0
+                        ? [
+                            {
+                              label: 'Non-taxable',
+                              amount: row.socialSecurity.total - row.socialSecurity.taxableFederal,
+                              derived: true,
+                            },
+                          ]
+                        : []),
                       ...(row.socialSecurity.taxableState > 0
                         ? [{ label: 'Taxable (state)', amount: row.socialSecurity.taxableState }]
                         : []),
@@ -952,7 +1123,7 @@ function StandardTable({
                       .map((l) => ({ label: l.name, amount: l.match }))}
                   />
                 </ValueCell>
-                <ValueCell value={`$${fmt(row.totalTax)}`} label="Taxes">
+                <ValueCell value={`$${fmt(row.totalTax)}`} label="Taxes" width={320}>
                   <BreakdownList rows={taxBreakdownRows(row)} />
                 </ValueCell>
                 <ValueCell

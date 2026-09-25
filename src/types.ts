@@ -485,6 +485,18 @@ export interface SpendingAllocation {
   // with scenarios saved before this field existed — read as `?? false`
   // wherever it's consumed.
   medicalRelated?: boolean
+  // Marks this line as a pre-tax payroll deduction (e.g. employer-sponsored
+  // health insurance premiums) rather than an after-tax expense: it's still
+  // counted normally in expenseTotal/committed (real money the household
+  // doesn't have to spend elsewhere), but it's also subtracted from taxable
+  // ordinary income and FICA wages (see runProjection's baseOrdinary/
+  // payrollWages), since — unlike an ordinary expense paid out of already-
+  // taxed take-home pay — this amount was never part of taxable wages to
+  // begin with. Matches how a Section 125 cafeteria-plan deduction is
+  // excluded from W-2 boxes 1, 3, and 5. Optional for backward compatibility
+  // with scenarios saved before this field existed; read as `?? false`
+  // wherever it's consumed.
+  preTax?: boolean
 }
 
 // Shared by every domain's plan ranges. Ranges are always stored as actual

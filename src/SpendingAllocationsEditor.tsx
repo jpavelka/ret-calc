@@ -137,6 +137,17 @@ export function SpendingAllocationsEditor({
                     />
                     Medical related
                   </label>
+
+                  <label className="flex items-center gap-1.5 text-sm text-slate-600">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                      checked={allocation.preTax ?? false}
+                      onChange={(e) => updateAllocation(allocation.id, { preTax: e.target.checked })}
+                    />
+                    Pre-tax deduction
+                    <HelpTooltip text="For a payroll deduction taken out before taxes, e.g. employer-sponsored health insurance premiums. Still counts as spending, but is excluded from taxable wages and Social Security/Medicare tax, same as a 401(k) or HSA contribution." />
+                  </label>
                 </div>
 
                 <AmountSourceFormulaRow
@@ -198,6 +209,11 @@ export function SpendingAllocationsEditor({
                   {allocation.medicalRelated && (
                     <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
                       Medical
+                    </span>
+                  )}
+                  {allocation.preTax && (
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                      Pre-tax
                     </span>
                   )}
                 </div>
