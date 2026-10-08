@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { birthYear, calculateAge, deathYear } from './age'
+import { AcaCoverageRangesEditor } from './AcaCoverageRangesEditor'
 import { AwiTableEditor } from './AwiTableEditor'
 import {
   convertDanglingIncomeVariableRefs,
@@ -30,6 +31,7 @@ import { CheckboxField } from './CheckboxField'
 import { CollapsibleSection } from './CollapsibleSection'
 import { CurrencyField } from './CurrencyField'
 import { DateField } from './DateField'
+import { DependentsEditor } from './DependentsEditor'
 import { DividendPolicyRangesEditor } from './DividendPolicyRangesEditor'
 import { flatRateHistoryContext } from './formula'
 import { FraTableEditor } from './FraTableEditor'
@@ -57,7 +59,6 @@ import { TaxBracketsEditor } from './TaxBracketsEditor'
 import { VariablesEditor } from './VariablesEditor'
 import type {
   CustomFunction,
-  Metric,
   Owner,
   OwnedAccountBalances,
   RetirementInputs,
@@ -716,6 +717,18 @@ export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }:
             help="Used to work out your spouse's current age, and later to determine penalty-free withdrawal ages for accounts owned by your spouse."
           />
         )}
+        <div className="col-span-full">
+          <h3 className="flex items-center gap-1 text-sm font-medium text-slate-700">
+            Dependents
+            <HelpTooltip text="Tracked by birth date rather than just a count, since a dependent's age matters for age-based tax calculations — currently used to size household for the ACA premium tax credit (see the Health insurance section below), and may back other dependent-based credits later." />
+          </h3>
+          <div className="mt-2">
+            <DependentsEditor
+              dependents={inputs.dependents}
+              onChange={(dependents) => onChange({ ...inputs, dependents })}
+            />
+          </div>
+        </div>
       </Section>
 
       <CollapsibleSection
@@ -1026,6 +1039,86 @@ export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }:
                 }
                 help="Federal bracket thresholds and the standard deduction are indexed to inflation by law, so — like income and spending amounts — they're entered above in today's dollars and grown each projection year by the inflation rate. Turn off to model a bracket freeze instead."
               />
+              <div>
+                <h4 className="flex items-center gap-1 text-xs font-semibold text-slate-500">
+                  Child Tax Credit &amp; Credit for Other Dependents
+                  <HelpTooltip text="Federal-only credits for each dependent from the Dependents list in Assumptions who's still a tax dependent that year (see Dependent.taxDependentUntilAge there). A dependent under the qualifying age gets the larger, partially-refundable Child Tax Credit; an older dependent gets the smaller, nonrefundable Credit for Other Dependents. Both phase out together above the same income threshold. Defaults to 2026 figures under the One Big Beautiful Bill Act (OBBBA, enacted July 2025)." />
+                </h4>
+                <div className="mt-2 flex flex-wrap gap-4">
+                  <div className="w-40">
+                    <NumberField
+                      label="Qualifies as 'child' under"
+                      min={0}
+                      value={inputs.childTaxCreditQualifyingAge}
+                      onChange={(v) => onChange({ ...inputs, childTaxCreditQualifyingAge: v })}
+                      help="A dependent under this age at year-end gets the Child Tax Credit; at or above it (but still a tax dependent), the smaller Credit for Other Dependents instead. Fixed by law at 17."
+                    />
+                  </div>
+                  <div className="w-40">
+                    <CurrencyField
+                      label="Child Tax Credit"
+                      min={0}
+                      value={inputs.childTaxCreditAmount}
+                      onChange={(v) => onChange({ ...inputs, childTaxCreditAmount: v })}
+                      help="Per qualifying child, before the phase-out below."
+                    />
+                  </div>
+                  <div className="w-44">
+                    <CurrencyField
+                      label="...refundable up to"
+                      min={0}
+                      value={inputs.childTaxCreditRefundableAmount}
+                      onChange={(v) => onChange({ ...inputs, childTaxCreditRefundableAmount: v })}
+                      help="If the credit exceeds federal income tax owed, up to this much per qualifying child is paid as a refund instead of lost (the Additional Child Tax Credit). Real law also caps this at 15% of earned income above $2,500 — not modeled here, so this can overstate the refund for a household with little wage income."
+                    />
+                  </div>
+                  <div className="w-40">
+                    <CurrencyField
+                      label="Credit for Other Dependents"
+                      min={0}
+                      value={inputs.otherDependentCreditAmount}
+                      onChange={(v) => onChange({ ...inputs, otherDependentCreditAmount: v })}
+                      help="Per dependent who doesn't qualify for the Child Tax Credit — e.g. a dependent college student or an elderly parent. Fully nonrefundable, and fixed by law (not inflation-adjusted)."
+                    />
+                  </div>
+                  <CheckboxField
+                    label="Child Tax Credit keeps pace with inflation"
+                    checked={inputs.childTaxCreditInflationAdjusted}
+                    onChange={(childTaxCreditInflationAdjusted) =>
+                      onChange({ ...inputs, childTaxCreditInflationAdjusted })
+                    }
+                    help="Both the Child Tax Credit and its refundable cap are indexed to inflation by law (rounded to the nearest $100 — approximated here as a continuous scale). The Credit for Other Dependents is never indexed."
+                  />
+                  <div className="w-44">
+                    <CurrencyField
+                      label="Phase-out starts at (single)"
+                      min={0}
+                      value={inputs.dependentCreditPhaseOutThresholdSingle}
+                      onChange={(v) => onChange({ ...inputs, dependentCreditPhaseOutThresholdSingle: v })}
+                    />
+                  </div>
+                  <div className="w-48">
+                    <CurrencyField
+                      label="Phase-out starts at (married)"
+                      min={0}
+                      value={inputs.dependentCreditPhaseOutThresholdMFJ}
+                      onChange={(v) => onChange({ ...inputs, dependentCreditPhaseOutThresholdMFJ: v })}
+                      help="Used instead of the single threshold whenever spouse mode is on. Neither threshold is inflation-adjusted — fixed by law."
+                    />
+                  </div>
+                  <div className="w-40">
+                    <NumberField
+                      label="Phase-out rate"
+                      suffix="%"
+                      min={0}
+                      step={0.1}
+                      value={inputs.dependentCreditPhaseOutRatePct}
+                      onChange={(v) => onChange({ ...inputs, dependentCreditPhaseOutRatePct: v })}
+                      help="Percent of MAGI over the threshold that reduces the combined credit. Real law reduces it by $50 per $1,000 (or fraction) of excess — approximated here as a continuous 5% of the excess."
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
           <div>
@@ -1066,6 +1159,15 @@ export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }:
                     value={inputs.statePersonalExemption}
                     onChange={(v) => onChange({ ...inputs, statePersonalExemption: v })}
                     help="Some states, like Kansas, allow a personal exemption on top of the standard deduction. Leave at 0 if your state doesn't have one."
+                  />
+                </div>
+                <div className="w-48">
+                  <CurrencyField
+                    label="Personal exemption, per dependent"
+                    min={0}
+                    value={inputs.statePersonalExemptionPerDependent}
+                    onChange={(v) => onChange({ ...inputs, statePersonalExemptionPerDependent: v })}
+                    help="Some states, like Kansas, add a further exemption for each dependent, on top of the flat personal exemption above. Multiplied each year by however many entries in the Dependents list (Assumptions) still count as a tax dependent then (the same test the federal Child Tax Credit/Credit for Other Dependents use). Leave at 0 if your state doesn't have one."
                   />
                 </div>
               </div>
@@ -1202,6 +1304,121 @@ export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }:
                   />
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        id="aca"
+        title={
+          <>
+            Health insurance (ACA)
+            <HelpTooltip text="Marketplace premium tax credit — reduces net health-insurance spending based on income relative to the federal poverty line. Off by default (no coverage ranges below); add a range to model buying an ACA marketplace plan for a period." />
+          </>
+        }
+      >
+        <div className="flex flex-col gap-5">
+          <p className="text-sm text-slate-500">
+            Household size here is 1, plus your spouse if spouse mode is on, plus any dependent from the Dependents
+            list in Assumptions who hasn't yet aged off a parent's health insurance that year.
+          </p>
+          <div>
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
+              Federal poverty guideline
+              <HelpTooltip text="The federal poverty line for your household size is this base amount (household size 1) plus the per-additional-person amount for each person beyond the first. Defaults to the 2025 guideline for the 48 contiguous states + DC (used for 2026 marketplace coverage) — transcribed by hand, worth checking against aspe.hhs.gov before relying on it." />
+            </h3>
+            <div className="mt-2 flex flex-wrap gap-4">
+              <div className="w-44">
+                <CurrencyField
+                  label="Base (household of 1)"
+                  min={0}
+                  value={inputs.acaFederalPovertyGuideline.basePerson1}
+                  onChange={(v) =>
+                    onChange({
+                      ...inputs,
+                      acaFederalPovertyGuideline: { ...inputs.acaFederalPovertyGuideline, basePerson1: v },
+                    })
+                  }
+                />
+              </div>
+              <div className="w-44">
+                <CurrencyField
+                  label="Per additional person"
+                  min={0}
+                  value={inputs.acaFederalPovertyGuideline.perAdditionalPerson}
+                  onChange={(v) =>
+                    onChange({
+                      ...inputs,
+                      acaFederalPovertyGuideline: { ...inputs.acaFederalPovertyGuideline, perAdditionalPerson: v },
+                    })
+                  }
+                />
+              </div>
+            </div>
+            <div className="mt-2">
+              <CheckboxField
+                label="Poverty guideline keeps pace with inflation"
+                checked={inputs.acaFplInflationAdjusted}
+                onChange={(acaFplInflationAdjusted) => onChange({ ...inputs, acaFplInflationAdjusted })}
+                help="HHS raises the poverty guideline roughly with inflation most years, though it's not indexed by law the way federal tax brackets are. On by default."
+              />
+            </div>
+          </div>
+          <div>
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
+              Applicable percentage schedule
+              <HelpTooltip text="How much of income (MAGI) a household is expected to contribute toward the benchmark premium, by income as a percent of the federal poverty line. Unlike the tax brackets above, 'Starting income' here means percent of the federal poverty line (e.g. 150 = 150% FPL), not dollars, and the rate at a given FPL% is interpolated between the points below rather than applied as a marginal step. Defaults to the pre-ARPA statutory schedule — current law for 2026+ coverage, since the ARPA/IRA enhanced schedule (no 400%-FPL cliff, capped at 8.5%) expired 2025-12-31." />
+            </h3>
+            <div className="mt-2">
+              <TaxBracketsEditor
+                brackets={inputs.acaApplicablePercentageSchedule}
+                onChange={(acaApplicablePercentageSchedule) =>
+                  onChange({ ...inputs, acaApplicablePercentageSchedule })
+                }
+                emptyMessage="No applicable-percentage schedule — no credit will be calculated."
+                addLabel="Add FPL% breakpoint"
+                removeLabel="Remove breakpoint"
+              />
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-4">
+              <CheckboxField
+                label="Hard cliff above 400% FPL (current law)"
+                checked={inputs.acaCliffAt400Pct}
+                onChange={(acaCliffAt400Pct) => onChange({ ...inputs, acaCliffAt400Pct })}
+                help="On: a household above 400% FPL gets no credit at all, the pre-ARPA statutory rule and current law for 2026+ coverage. Off: no cliff — expected contribution above 400% FPL is instead capped at the percentage below, the ARPA/IRA-style extension that applied 2021-2025 before expiring."
+              />
+              {!inputs.acaCliffAt400Pct && (
+                <div className="w-36">
+                  <NumberField
+                    label="Cap above 400% FPL"
+                    suffix="%"
+                    min={0}
+                    step={0.1}
+                    value={inputs.acaCapAbovePct400}
+                    onChange={(v) => onChange({ ...inputs, acaCapAbovePct400: v })}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-slate-600">Coverage</h3>
+            <div className="mt-2">
+              <AcaCoverageRangesEditor
+                bare
+                ranges={inputs.acaCoverageRanges}
+                onChange={(acaCoverageRanges) => onChange({ ...inputs, acaCoverageRanges })}
+                variables={inputs.variables}
+                resolvedVariableAmounts={resolvedVariableAmounts}
+                birthYear={birthYear(inputs.birthDate)}
+                spouseBirthYear={spouseBirthYear}
+                deathYear={deathYr}
+                specialYears={inputs.specialYears}
+                mode={yearMode}
+                history={formulaHistory}
+                functions={functionsContext}
+              />
             </div>
           </div>
         </div>

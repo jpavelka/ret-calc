@@ -1,16 +1,22 @@
 import { birthYear, deathYear as computeDeathYear, hasReachedAgeDuringYear } from './age'
 import { calculateMatchAmount } from './match'
 import { benefitScheduleForOwner, taxableSocialSecurityBenefit } from './socialSecurity'
-import { bracketBreakdown, computeIncomeTaxes, prepareTaxSchedules, scaleTaxSchedules } from './tax'
-import type { BracketBreakdownEntry } from './tax'
+import { bracketBreakdown, computeDependentCredit, computeIncomeTaxes, prepareTaxSchedules, scaleTaxSchedules } from './tax'
+import type { BracketBreakdownEntry, DependentCreditConfig, DependentCreditResult } from './tax'
+import { computePtc } from './aca'
+import type { AcaPtcResult } from './aca'
 import { FormulaError, tryEvaluateFormula, tryEvaluateCondition } from './formula'
 import type { AccountHistoryKey, FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { buildFormulaFunctions } from './functions'
 import { CURRENT_YEAR_SPECIAL_NAME, DEATH_YEAR_SPECIAL_NAME, DEATH_AGE_SPECIAL_NAME } from './specialYearGraph'
 import { resolveVariableAmounts } from './variables'
+import { DEFAULT_TAX_DEPENDENT_UNTIL_AGE } from './types'
 import type {
+  AcaCoveragePlanRange,
+  AcaFederalPovertyGuideline,
   AccountType,
   AmountSource,
+  Dependent,
   DividendPolicy,
   DividendPolicyPlanRange,
   Frequency,
@@ -97,11 +103,22 @@ export interface YearProjectionRow {
   // Display-only breakdown of what fed into the tax calculation below.
   preTaxSavingsDeferrals: number
   hsaSavingsContributions: number
+  // Spending lines flagged preTax (e.g. Section 125 health insurance
+  // premiums) — reduces taxable ordinary income the same way the two
+  // fields above do, but isn't part of savingsEmployeeTotal since it's
+  // spending, not saving. Display-only.
+  preTaxSpendingDeductions: number
 
   // AGI subject to ordinary rates, before either jurisdiction's own
   // deduction — the shared input behind federalTaxableIncome and
   // stateTaxableIncome below. Display-only.
   adjustedOrdinary: number
+  // Modified AGI (as used for ACA premium-tax-credit/IRMAA/Roth-eligibility
+  // purposes): AGI (adjustedOrdinary + this year's capital gains/dividends)
+  // plus the non-taxable share of Social Security. Always computed,
+  // independent of ACA eligibility — a general tax concept useful beyond
+  // ACA. Display-only.
+  magi: number
   // The deductions federalTaxableIncome/stateTaxableIncome below were
   // computed net of. Federal has no separate personal-exemption concept in
   // this model, so its whole deduction is the standard deduction; state
@@ -110,6 +127,10 @@ export interface YearProjectionRow {
     federalStandardDeduction: number
     stateStandardDeduction: number
     statePersonalExemption: number
+    // This year's inputs.statePersonalExemptionPerDependent × however many
+    // dependents still count as a tax dependent this year — already folded
+    // into stateTaxableIncome above.
+    statePersonalExemptionPerDependent: number
     // This year's state-only deduction for contributions into an account
     // covered by inputs.stateContributionDeductions (e.g. Kansas's 529
     // deduction) — already capped and folded into stateTaxableIncome above.
@@ -264,6 +285,42 @@ export interface YearProjectionRow {
   // value, keyed by Metric.id, or null if the formula errored this year.
   // Metrics with a blank formula have no entry here. See metricAverageInRun.
   metricResults: Record<string, number | null>
+
+  // ACA marketplace premium tax credit for this year — null when no
+  // acaCoverageRanges entry is active, or neither spouse is under 65 (see
+  // runProjection's acaEligible). netPremium (actualPremium minus
+  // premiumTaxCredit) is already folded into this year's cash need/
+  // withdrawals; every other field here is display-only breakdown.
+  aca: {
+    householdSize: number
+    magi: number
+    fpl: number
+    fplPct: number
+    applicablePct: number
+    expectedContribution: number
+    benchmarkPremium: number
+    actualPremium: number
+    premiumTaxCredit: number
+    netPremium: number
+  } | null
+
+  // Federal Child Tax Credit + Credit for Other Dependents for this year —
+  // present even when both counts are 0 (unlike `aca` above, there's no
+  // "not applicable" case, just $0 credit). nonRefundableApplied is already
+  // reflected in totalTax (federalTax/stateTax stay gross — see
+  // taxBreakdownRows' dependent credit line for the reconciliation), and
+  // refundableCredit is already folded into this year's cash need/
+  // withdrawals via totalTax as well; every other field is display-only
+  // breakdown.
+  dependentCredit: {
+    qualifyingChildCount: number
+    otherDependentCount: number
+    grossCredit: number
+    phaseOutReduction: number
+    creditAfterPhaseOut: number
+    nonRefundableApplied: number
+    refundableCredit: number
+  }
 }
 
 interface RangeBounds {
@@ -352,6 +409,86 @@ function activeConversionAmount(
 function activeDividendPolicy(ranges: DividendPolicyPlanRange[], year: number): DividendPolicy {
   const matches = activeRanges(ranges, year)
   return matches.length > 0 ? matches[matches.length - 1].policy : 'reinvest'
+}
+
+interface ResolvedAcaCoverage {
+  actualPremium: number
+  benchmarkPremium: number
+}
+
+// Unlike activeConversionAmount, resolves to a single coverage range rather
+// than summing — like activeDividendPolicy, acaCoverageRanges are validated
+// not to overlap (see findOverlappingRangeIds), so at most one range should
+// ever match; if an in-progress edit leaves an overlap anyway, the last
+// match in list order wins as a defensive fallback. No matching range means
+// no ACA coverage modeled this year (null, not zero premiums — the
+// eligibility gate in runProjection treats this as "not ACA-eligible").
+function activeAcaCoverage(
+  ranges: AcaCoveragePlanRange[],
+  year: number,
+  variablesById: Map<string, Variable>,
+  resolvedVariableAmounts: Map<string, number>,
+  yearScope: Record<string, number>,
+  inflationFactor: number,
+  history?: FormulaHistoryContext,
+  functions?: FormulaFunctionsContext,
+): ResolvedAcaCoverage | null {
+  const matches = activeRanges(ranges, year)
+  if (matches.length === 0) return null
+  const range = matches[matches.length - 1]
+  const resolve = (source: AmountSource, suffix: string) => {
+    const resolved = resolveAllocation(
+      { id: `${range.id}-${suffix}`, source },
+      variablesById,
+      resolvedVariableAmounts,
+      yearScope,
+      history,
+      functions,
+    )
+    if (!resolved) return 0
+    return Math.max(0, resolved.inflationAdjusted ? resolved.amount * inflationFactor : resolved.amount)
+  }
+  return {
+    actualPremium: resolve(range.actualPremium, 'actual'),
+    benchmarkPremium: resolve(range.benchmarkPremium, 'benchmark'),
+  }
+}
+
+// How many of inputs.dependents still count toward household size this
+// year — those who haven't yet reached their own agesOffCoverageAt during
+// this year (same "reaches the milestone sometime this year -> counted
+// from then on" semantics hasReachedAgeDuringYear provides for runProjection's
+// self/spouse ACA age-65 gate).
+function activeDependentCount(dependents: Dependent[], year: number): number {
+  return dependents.filter((d) => !hasReachedAgeDuringYear(d.birthDate, d.agesOffCoverageAt, year)).length
+}
+
+// Splits inputs.dependents into Child Tax Credit vs. Credit for Other
+// Dependents counts for a given year — independent of activeDependentCount
+// above, since ACA household size and tax-dependent status use separate
+// per-dependent cutoffs (Dependent.agesOffCoverageAt vs.
+// Dependent.taxDependentUntilAge; see their doc comments in types.ts).
+function dependentCreditCounts(
+  dependents: Dependent[],
+  year: number,
+  qualifyingAge: number,
+): { qualifyingChildCount: number; otherDependentCount: number } {
+  let qualifyingChildCount = 0
+  let otherDependentCount = 0
+  for (const d of dependents) {
+    if (hasReachedAgeDuringYear(d.birthDate, d.taxDependentUntilAge ?? DEFAULT_TAX_DEPENDENT_UNTIL_AGE, year)) {
+      continue // no longer a dependent at all
+    }
+    if (hasReachedAgeDuringYear(d.birthDate, qualifyingAge, year)) otherDependentCount++
+    else qualifyingChildCount++
+  }
+  return { qualifyingChildCount, otherDependentCount }
+}
+
+// A NaN/Infinity input value (e.g. a NumberField momentarily cleared
+// mid-edit) falls back to `fallback` instead of propagating.
+function finiteOr(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback
 }
 
 function sumValues(map: Map<string, number>): number {
@@ -1429,6 +1566,27 @@ export function runProjection(
       return total + Math.min(Math.max(0, contributed), cap)
     }, 0)
 
+    // Computed once here (rather than separately alongside the federal
+    // dependent-credit block below) since both it and the state per-
+    // dependent exemption just below need the same "still a tax dependent
+    // this year" counts.
+    const { qualifyingChildCount, otherDependentCount } = dependentCreditCounts(
+      inputs.dependents,
+      year,
+      inputs.childTaxCreditQualifyingAge,
+    )
+    // Some states (Kansas among them) add a further personal exemption per
+    // dependent, on top of statePersonalExemption's flat figure — see
+    // RetirementInputs.statePersonalExemptionPerDependent. Scaled by the same
+    // inflation flag as statePersonalExemption, since it's the same kind of
+    // figure (state exemptions aren't part of TaxSchedules, which is only
+    // rebuilt per year via scaleTaxSchedules, because this term also depends
+    // on the year's dependent count, not just inflation).
+    const stateDeductionFactor = inputs.stateBracketsInflationAdjusted ? inflationFactor : 1
+    const statePersonalExemptionPerDependentAmount =
+      (qualifyingChildCount + otherDependentCount) * inputs.statePersonalExemptionPerDependent * stateDeductionFactor
+    const stateOnlyDeductionAmount = stateContributionDeductionAmount + statePersonalExemptionPerDependentAmount
+
     // --- Roth conversion ---
     // An elective transfer from pre-tax to Roth: taxed as ordinary income like
     // a pre-tax withdrawal, but — unlike one — never subject to the early-
@@ -1562,35 +1720,163 @@ export function runProjection(
       return { federal, state, otherAGI }
     }
 
+    // --- ACA marketplace premium tax credit ---
+    // Has the same shape of circularity as tax above: the credit depends on
+    // MAGI, which depends on plan.ordinaryIncome/plan.capitalGains — the
+    // same converging `plan` the tax calculation already depends on — so
+    // it's recomputed on the same solver iteration as computeIncomeTaxes
+    // below, rather than given its own inner solver loop. MAGI is
+    // otherAGI (from taxableSocialSecurityFor, which already equals AGI's
+    // ordinary+gains components) plus the full Social Security benefit
+    // (not just the taxable portion) — the taxable/untaxed split cancels
+    // out algebraically, since MAGI = AGI + untaxed SS = (otherAGI - SS
+    // already excluded) + SS.
+    const acaCoverage = activeAcaCoverage(
+      inputs.acaCoverageRanges,
+      year,
+      variablesById,
+      resolvedVariableAmounts,
+      yearScope,
+      inflationFactor,
+      historyContext,
+      functionsContext,
+    )
+    // "At least one spouse under 65" rather than "both" — a mixed-
+    // eligibility household (one spouse on Medicare, the other still on a
+    // marketplace plan) is still ACA-eligible. The app has no per-person
+    // Medicare/marketplace premium split, so during such a year the user is
+    // responsible for entering actualPremium/benchmarkPremium as the
+    // correct (possibly single-person) policy figures — consistent with
+    // every other dollar figure in this app being user-supplied rather than
+    // derived.
+    const selfAcaEligible = !hasReachedAgeDuringYear(inputs.birthDate, 65, year)
+    // false (not a wildcard "no constraint") when spouse mode is off, so a
+    // single filer's eligibility below reduces to selfAcaEligible alone
+    // rather than always passing via this side of the ||.
+    const spouseAcaEligible = inputs.spouseEnabled && !hasReachedAgeDuringYear(spousePenaltyBirthDate, 65, year)
+    const acaEligible = acaCoverage !== null && (selfAcaEligible || spouseAcaEligible)
+    // Household size counts both spouses regardless of individual Medicare
+    // eligibility, matching how the real PTC "tax family size" is defined,
+    // plus any dependent who hasn't yet aged off a parent's health
+    // insurance this year (see activeDependentCount).
+    const acaHouseholdSize =
+      1 + (inputs.spouseEnabled ? 1 : 0) + activeDependentCount(inputs.dependents, year)
+    const acaFplScaled: AcaFederalPovertyGuideline = {
+      basePerson1:
+        inputs.acaFederalPovertyGuideline.basePerson1 * (inputs.acaFplInflationAdjusted ? inflationFactor : 1),
+      perAdditionalPerson:
+        inputs.acaFederalPovertyGuideline.perAdditionalPerson * (inputs.acaFplInflationAdjusted ? inflationFactor : 1),
+    }
+    // Sorted once per year, not per solver iteration — never inflation-
+    // scaled (percentages of FPL%, not dollars).
+    const acaApplicableSchedule = [...inputs.acaApplicablePercentageSchedule].sort((a, b) => a.min - b.min)
+
+    function acaFor(otherAGI: number): AcaPtcResult | null {
+      if (!acaEligible || !acaCoverage) return null
+      return computePtc({
+        magi: otherAGI + ssBenefitTotal,
+        householdSize: acaHouseholdSize,
+        fplGuideline: acaFplScaled,
+        applicableSchedule: acaApplicableSchedule,
+        actualPremium: acaCoverage.actualPremium,
+        benchmarkPremium: acaCoverage.benchmarkPremium,
+        cliffAt400Pct: inputs.acaCliffAt400Pct,
+        capAbovePct400: inputs.acaCapAbovePct400,
+      })
+    }
+
+    // --- Child Tax Credit / Credit for Other Dependents ---
+    // Same shape of circularity as tax/ACA above: the credit's MAGI phase-
+    // out depends on plan.ordinaryIncome/plan.capitalGains, so it's
+    // recomputed on the same solver iteration as computeIncomeTaxes below,
+    // not given its own inner solver loop. qualifyingChildCount/
+    // otherDependentCount were already computed above, alongside the state
+    // per-dependent exemption, which needs the same counts.
+    // finiteOr guards each figure individually — a household that actually
+    // has dependents shouldn't have every year's tax total go NaN just
+    // because one of these fields is momentarily empty mid-edit (every
+    // NumberField in this app renders NaN as a blank input while editing).
+    // Falling back to 0 understates the credit for that instant rather than
+    // destroying the whole projection, and self-corrects once a real number
+    // is typed.
+    const dependentCreditConfig: DependentCreditConfig = {
+      childTaxCreditAmount:
+        finiteOr(inputs.childTaxCreditAmount, 0) * (inputs.childTaxCreditInflationAdjusted ? inflationFactor : 1),
+      childTaxCreditRefundableAmount:
+        finiteOr(inputs.childTaxCreditRefundableAmount, 0) *
+        (inputs.childTaxCreditInflationAdjusted ? inflationFactor : 1),
+      // Fixed by law, never inflation-adjusted.
+      otherDependentCreditAmount: finiteOr(inputs.otherDependentCreditAmount, 0),
+      phaseOutThreshold: finiteOr(
+        inputs.spouseEnabled ? inputs.dependentCreditPhaseOutThresholdMFJ : inputs.dependentCreditPhaseOutThresholdSingle,
+        Infinity, // an unreadable threshold should never phase out the credit
+      ),
+      phaseOutRatePct: finiteOr(inputs.dependentCreditPhaseOutRatePct, 0),
+    }
+
+    function depCreditFor(federalOrdinaryPlusGains: number, magi: number): DependentCreditResult {
+      return computeDependentCredit(
+        federalOrdinaryPlusGains,
+        magi,
+        qualifyingChildCount,
+        otherDependentCount,
+        dependentCreditConfig,
+      )
+    }
+
+    const initialSsTaxable = taxableSocialSecurityFor({ ordinaryIncome: 0, capitalGains: 0 })
+    let acaResult = acaFor(initialSsTaxable.otherAGI)
+    const initialTax = computeIncomeTaxes(
+      taxSchedules,
+      baseOrdinary,
+      0,
+      dividendIncome,
+      0,
+      initialSsTaxable,
+      stateOnlyDeductionAmount,
+    )
+    let dependentCreditResult = depCreditFor(
+      initialTax.federalOrdinary + initialTax.federalCapitalGains,
+      initialTax.adjustedOrdinary + dividendIncome,
+    )
     let need = Math.max(
       0,
       committed +
+        (acaResult?.netPremium ?? 0) +
         ficaTax +
-        computeIncomeTaxes(
-          taxSchedules,
-          baseOrdinary,
-          0,
-          dividendIncome,
-          0,
-          taxableSocialSecurityFor({ ordinaryIncome: 0, capitalGains: 0 }),
-          stateContributionDeductionAmount,
-        ).total -
+        initialTax.total -
+        dependentCreditResult.totalCredit -
         incomeTotal -
         ssBenefitTotal,
     )
     let plan = planWithdrawals(sources, need, withdrawalContext, withdrawalSteps)
     let solverConverged = need === 0
     for (let i = 0; i < SOLVER_MAX_ITERATIONS && !solverConverged; i++) {
+      const ssTaxableIter = taxableSocialSecurityFor(plan)
+      acaResult = acaFor(ssTaxableIter.otherAGI)
       const iterationTax = computeIncomeTaxes(
         taxSchedules,
         baseOrdinary,
         plan.ordinaryIncome,
         plan.capitalGains + dividendIncome,
         plan.penalty,
-        taxableSocialSecurityFor(plan),
-        stateContributionDeductionAmount,
+        ssTaxableIter,
+        stateOnlyDeductionAmount,
       )
-      const nextNeed = Math.max(0, committed + ficaTax + iterationTax.total - incomeTotal - ssBenefitTotal)
+      dependentCreditResult = depCreditFor(
+        iterationTax.federalOrdinary + iterationTax.federalCapitalGains,
+        iterationTax.adjustedOrdinary + plan.capitalGains + dividendIncome,
+      )
+      const nextNeed = Math.max(
+        0,
+        committed +
+          (acaResult?.netPremium ?? 0) +
+          ficaTax +
+          iterationTax.total -
+          dependentCreditResult.totalCredit -
+          incomeTotal -
+          ssBenefitTotal,
+      )
       solverConverged = Math.abs(nextNeed - need) <= SOLVER_TOLERANCE
       need = nextNeed
       // The loop has to end on a plan, not a tax figure, so the plan actually
@@ -1599,6 +1885,8 @@ export function runProjection(
     }
 
     const ssTaxable = taxableSocialSecurityFor(plan)
+    const magi = ssTaxable.otherAGI + ssBenefitTotal
+    acaResult = acaFor(ssTaxable.otherAGI)
     const incomeTax = computeIncomeTaxes(
       taxSchedules,
       baseOrdinary,
@@ -1606,11 +1894,19 @@ export function runProjection(
       plan.capitalGains + dividendIncome,
       plan.penalty,
       ssTaxable,
-      stateContributionDeductionAmount,
+      stateOnlyDeductionAmount,
     )
+    dependentCreditResult = depCreditFor(
+      incomeTax.federalOrdinary + incomeTax.federalCapitalGains,
+      incomeTax.adjustedOrdinary + plan.capitalGains + dividendIncome,
+    )
+    // federalTax/stateTax stay gross (pre-credit) so each jurisdiction's own
+    // bracket breakdown still sums to its displayed total — the credit is
+    // reconciled into totalTax instead (see taxBreakdownRows' dependent
+    // credit line) and folded into `need`/extraTaxableSavings above/below.
     const federalTax = incomeTax.federalOrdinary + incomeTax.federalCapitalGains
     const stateTax = incomeTax.stateOrdinary + incomeTax.stateCapitalGains
-    const totalTax = incomeTax.total + ficaTax
+    const totalTax = incomeTax.total + ficaTax - dependentCreditResult.totalCredit
 
     // --- Cash flow: expenses + savings plan first, then either sweep the
     // leftover into taxable or run the withdrawal waterfall ---
@@ -1638,7 +1934,13 @@ export function runProjection(
     // included), came in beyond what taxes/savings/spending used up.
     const extraTaxableSavings = Math.max(
       0,
-      incomeTotal + ssBenefitTotal + plan.total - totalTax - savingsEmployeeTotal - expenseTotal,
+      incomeTotal +
+        ssBenefitTotal +
+        plan.total -
+        totalTax -
+        savingsEmployeeTotal -
+        expenseTotal -
+        (acaResult?.netPremium ?? 0),
     )
     applyWithdrawalPlan(balances, plan)
     if (catchAllLine) {
@@ -1780,12 +2082,13 @@ export function runProjection(
     // taxSchedules.stateDeduction is standard deduction + personal exemption
     // combined (see prepareTaxSchedules) — split back out here purely for
     // display, using the same inflation factor scaleTaxSchedules applied to
-    // the combined figure.
-    const stateDeductionFactor = inputs.stateBracketsInflationAdjusted ? inflationFactor : 1
+    // the combined figure (stateDeductionFactor, computed earlier alongside
+    // statePersonalExemptionPerDependentAmount).
     const taxDeductions = {
       federalStandardDeduction: taxSchedules.federalDeduction,
       stateStandardDeduction: inputs.stateStandardDeduction * stateDeductionFactor,
       statePersonalExemption: inputs.statePersonalExemption * stateDeductionFactor,
+      statePersonalExemptionPerDependent: statePersonalExemptionPerDependentAmount,
       stateContributionDeduction: stateContributionDeductionAmount,
     }
 
@@ -1812,7 +2115,9 @@ export function runProjection(
       savingsByLine,
       preTaxSavingsDeferrals: preTaxDeferrals,
       hsaSavingsContributions: hsaContributions,
+      preTaxSpendingDeductions: preTaxSpendingTotal,
       adjustedOrdinary: incomeTax.adjustedOrdinary,
+      magi,
       taxDeductions,
       federalTax,
       federalCapitalGainsTax: incomeTax.federalCapitalGains,
@@ -1875,6 +2180,29 @@ export function runProjection(
       inflationFactor,
       goalResults,
       metricResults,
+      aca: acaResult
+        ? {
+            householdSize: acaResult.householdSize,
+            magi: acaResult.magi,
+            fpl: acaResult.fpl,
+            fplPct: acaResult.fplPct,
+            applicablePct: acaResult.applicablePct,
+            expectedContribution: acaResult.expectedContribution,
+            benchmarkPremium: acaResult.benchmarkPremium,
+            actualPremium: acaResult.actualPremium,
+            premiumTaxCredit: acaResult.premiumTaxCredit,
+            netPremium: acaResult.netPremium,
+          }
+        : null,
+      dependentCredit: {
+        qualifyingChildCount: dependentCreditResult.qualifyingChildCount,
+        otherDependentCount: dependentCreditResult.otherDependentCount,
+        grossCredit: dependentCreditResult.grossCredit,
+        phaseOutReduction: dependentCreditResult.phaseOutReduction,
+        creditAfterPhaseOut: dependentCreditResult.creditAfterPhaseOut,
+        nonRefundableApplied: dependentCreditResult.nonRefundableApplied,
+        refundableCredit: dependentCreditResult.refundableCredit,
+      },
     })
 
     incomeHistory.unshift(incomeTotal)

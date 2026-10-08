@@ -16,6 +16,7 @@ const SECTIONS = [
   { id: 'savings', label: 'Savings' },
   { id: 'withdrawals', label: 'Withdrawals' },
   { id: 'taxes', label: 'Taxes' },
+  { id: 'aca', label: 'Health insurance (ACA)' },
   { id: 'social-security', label: 'Social Security' },
   { id: 'roth-conversions', label: 'Roth conversions' },
   { id: 'dividends', label: 'Dividend policy' },

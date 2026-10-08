@@ -262,3 +262,96 @@ export function computeIncomeTaxes(
     adjustedOrdinary: federalAgi,
   }
 }
+
+export interface DependentCreditConfig {
+  childTaxCreditAmount: number
+  childTaxCreditRefundableAmount: number
+  otherDependentCreditAmount: number
+  // Already resolved to single vs. married-filing-jointly by the caller.
+  phaseOutThreshold: number
+  phaseOutRatePct: number
+}
+
+export interface DependentCreditResult {
+  qualifyingChildCount: number
+  otherDependentCount: number
+  // Combined credit before the MAGI phase-out.
+  grossCredit: number
+  phaseOutReduction: number
+  // grossCredit less phaseOutReduction, floored at 0 — the total credit
+  // actually available this year, before splitting it into the portion that
+  // offsets tax owed vs. the portion (if any) paid as a refund.
+  creditAfterPhaseOut: number
+  // The part of creditAfterPhaseOut that offset federal income tax
+  // (ordinary + capital gains — never state, FICA, or penalty), capped at
+  // what was actually owed.
+  nonRefundableApplied: number
+  // Whatever of creditAfterPhaseOut wasn't needed to zero out federal
+  // income tax, capped at childTaxCreditRefundableAmount per qualifying
+  // child (the Additional Child Tax Credit) — the Credit for Other
+  // Dependents portion is never refundable, so a credit made up entirely of
+  // otherDependentCreditAmount that exceeds tax owed is simply forfeited,
+  // matching real law. Paid out as cash, not a tax reduction.
+  refundableCredit: number
+  // nonRefundableApplied + refundableCredit — the total dollar benefit
+  // delivered this year, whether via reduced tax or a cash refund.
+  totalCredit: number
+}
+
+// Federal Child Tax Credit + Credit for Other Dependents, combined (they
+// share one MAGI phase-out pool). Not state — this app models only the
+// federal versions; a handful of states have their own child tax credits,
+// not modeled here.
+//
+// Known limitation: real law caps the refundable Additional Child Tax
+// Credit at the LESSER of (unused credit) and (15% of earned income above
+// $2,500) — a retiree living off withdrawals/Social Security with little or
+// no wage income may not actually qualify for the full refundable amount in
+// reality. This app has no earned-vs-unearned income distinction, so
+// refundableCredit here assumes the earned-income test is always satisfied,
+// which can overstate the refund for a household with little wage income.
+export function computeDependentCredit(
+  federalIncomeTaxBeforeCredit: number,
+  magi: number,
+  qualifyingChildCount: number,
+  otherDependentCount: number,
+  config: DependentCreditConfig,
+): DependentCreditResult {
+  // Short-circuit without touching `config` at all — same "not applicable"
+  // reasoning as aca.ts's computePtc returning early, but doubly important
+  // here: this runs unconditionally every solver iteration regardless of
+  // whether the household has any dependents, so a stray NaN in a
+  // credit-amount input field (e.g. momentarily cleared mid-edit — every
+  // NumberField in this app tolerates that transiently) would otherwise
+  // poison every year's tax total even for the common case of zero
+  // dependents, rather than staying contained to this feature.
+  if (qualifyingChildCount === 0 && otherDependentCount === 0) {
+    return {
+      qualifyingChildCount: 0,
+      otherDependentCount: 0,
+      grossCredit: 0,
+      phaseOutReduction: 0,
+      creditAfterPhaseOut: 0,
+      nonRefundableApplied: 0,
+      refundableCredit: 0,
+      totalCredit: 0,
+    }
+  }
+  const grossCredit =
+    qualifyingChildCount * config.childTaxCreditAmount + otherDependentCount * config.otherDependentCreditAmount
+  const phaseOutReduction = Math.max(0, magi - config.phaseOutThreshold) * (config.phaseOutRatePct / 100)
+  const creditAfterPhaseOut = Math.max(0, grossCredit - phaseOutReduction)
+  const nonRefundableApplied = Math.min(creditAfterPhaseOut, Math.max(0, federalIncomeTaxBeforeCredit))
+  const maxRefundable = qualifyingChildCount * config.childTaxCreditRefundableAmount
+  const refundableCredit = Math.min(creditAfterPhaseOut - nonRefundableApplied, maxRefundable)
+  return {
+    qualifyingChildCount,
+    otherDependentCount,
+    grossCredit,
+    phaseOutReduction,
+    creditAfterPhaseOut,
+    nonRefundableApplied,
+    refundableCredit,
+    totalCredit: nonRefundableApplied + refundableCredit,
+  }
+}

@@ -39,6 +39,12 @@ export interface RetirementInputs {
   // penalty-free withdrawal ages per account owner.
   spouseEnabled: boolean
   spouseBirthDate: string
+  // Dependents (e.g. children) tracked for household-size purposes — see
+  // Dependent below. Currently used to size household for the ACA
+  // marketplace premium tax credit, but general rather than ACA-specific
+  // since a dependent's age also matters for other tax credits (e.g. the
+  // Child Tax Credit) not yet modeled here.
+  dependents: Dependent[]
   lifeExpectancy: number
   // Federal ordinary-income tax brackets and standard deduction. Defaults to
   // current tax-year IRS figures for a single filer, but both are editable
@@ -60,6 +66,15 @@ export interface RetirementInputs {
   // Some states (e.g. Kansas) allow a personal exemption on top of the
   // standard deduction — 0 for states that don't have one.
   statePersonalExemption: number
+  // Some states (Kansas among them) add a further exemption per dependent —
+  // multiplied each year by however many of inputs.dependents still count
+  // as a tax dependent then (the same test RetirementInputs.dependents used
+  // for the federal Child Tax Credit/Credit for Other Dependents uses — see
+  // Dependent.taxDependentUntilAge), rather than a flat count entered here.
+  // 0 for states that don't have one. Scaled by the same
+  // stateBracketsInflationAdjusted flag as statePersonalExemption above,
+  // since it's the same kind of figure.
+  statePersonalExemptionPerDependent: number
   // Unlike the federal case, state bracket/deduction indexing isn't uniform —
   // some states index automatically, others only via legislature — so this
   // defaults to on but is worth checking against your state's own rules.
@@ -92,6 +107,36 @@ export interface RetirementInputs {
   medicareTaxRatePct: number
   additionalMedicareTaxRatePct: number
   additionalMedicareTaxThreshold: number
+  // Child Tax Credit (federal): a per-qualifying-child credit (a dependent
+  // under childTaxCreditQualifyingAge at year-end — see Dependent below),
+  // partially refundable — if it exceeds federal income tax owed, up to
+  // childTaxCreditRefundableAmount/child of the excess is paid as a refund
+  // rather than lost. Both dollar amounts are inflation-indexed together
+  // (real law rounds to the nearest $100; scaled continuously here instead,
+  // same simplification this app already applies to other indexed figures).
+  // Defaults to 2026 figures under the One Big Beautiful Bill Act (OBBBA,
+  // enacted July 2025), which made the increased credit permanent.
+  childTaxCreditQualifyingAge: number
+  childTaxCreditAmount: number
+  childTaxCreditRefundableAmount: number
+  childTaxCreditInflationAdjusted: boolean
+  // Credit for Other Dependents (federal): a smaller, fully nonrefundable
+  // credit for a dependent who doesn't qualify for the Child Tax Credit
+  // (childTaxCreditQualifyingAge or older, but still a dependent — see
+  // Dependent.taxDependentUntilAge below) — e.g. a dependent college
+  // student or an elderly parent. Fixed by law, not inflation-adjusted.
+  otherDependentCreditAmount: number
+  // Both credits above phase out together once MAGI exceeds this threshold
+  // (single vs. married filing jointly, used whenever spouseEnabled is on),
+  // reduced by dependentCreditPhaseOutRatePct of the excess. Real law
+  // reduces the combined credit by $50 per $1,000 (or fraction) of excess —
+  // modeled here as a continuous percentage of the excess instead of that
+  // step function, the same tradeoff this app already makes for the ACA
+  // applicable-percentage schedule. The threshold itself is fixed by law,
+  // unlike the credit amounts above — not inflation-adjusted.
+  dependentCreditPhaseOutThresholdSingle: number
+  dependentCreditPhaseOutThresholdMFJ: number
+  dependentCreditPhaseOutRatePct: number
   // Required minimum distributions from pre-tax accounts (401(k)/IRA — not
   // Roth). rmdStartAge is the age at which they begin — defaulted here to 75,
   // SECURE 2.0's age for anyone born 1960 or later; it's 73 for those born
@@ -114,6 +159,43 @@ export interface RetirementInputs {
   // subtracted from state (never federal) taxable income; unused amounts do
   // not carry forward to future years.
   stateContributionDeductions: StateContributionDeduction[]
+  // Per-year-range ACA marketplace coverage: the actual premium paid and the
+  // benchmark (second-lowest-cost Silver plan) premium the credit is sized
+  // against. Like dividendPolicyRanges, these must NOT overlap — only one
+  // premium/benchmark pair applies to a given year — see
+  // findOverlappingRangeIds. A year not covered by any range has no ACA
+  // coverage modeled (no premium, no credit).
+  acaCoverageRanges: AcaCoveragePlanRange[]
+  // Federal poverty guideline, as a household-size-1 base plus a flat
+  // per-additional-person increment (the real HHS guideline is linear across
+  // household sizes 1-8). Defaults to the 2025 guideline (used for 2026
+  // marketplace coverage) — transcribed by hand, worth checking against
+  // aspe.hhs.gov before relying on it, which is also why it's editable
+  // rather than hard-coded.
+  acaFederalPovertyGuideline: AcaFederalPovertyGuideline
+  // HHS raises the poverty guideline roughly with inflation most years (not
+  // a legal requirement the way federal tax brackets are) — on by default,
+  // same convention as federalBracketsInflationAdjusted.
+  acaFplInflationAdjusted: boolean
+  // The sliding-scale "applicable percentage of income" schedule used to size
+  // the expected premium contribution. Reuses TaxBracket's {id, min, ratePct}
+  // shape purely for storage/editing convenience via TaxBracketsEditor, but
+  // the semantics differ from every other TaxBracket[] in this file: `min`
+  // here is a percent of the federal poverty line (e.g. 150 = 150% FPL), NOT
+  // a dollar amount, and the applicable percentage at a given FPL% is found
+  // by LINEAR INTERPOLATION between consecutive points (see aca.ts's
+  // applicablePercentageForFpl), not marginal-bracket accumulation the way
+  // tax.ts's bracketTax works. Never inflation-scaled — these are percentages
+  // of FPL%, not dollar thresholds.
+  acaApplicablePercentageSchedule: TaxBracket[]
+  // true (current law as of 2026): a household above 400% FPL gets no
+  // credit at all (the pre-ARPA statutory cliff). false: no cliff — the
+  // expected contribution above 400% FPL is instead capped at
+  // acaCapAbovePct400 of MAGI (the ARPA/IRA-style extension that applied
+  // 2021-2025 before expiring). Both behaviors have existed in recent law,
+  // so this is left as an editable assumption rather than hard-coded.
+  acaCliffAt400Pct: boolean
+  acaCapAbovePct400: number
   balances: {
     self: OwnedAccountBalances
     spouse: OwnedAccountBalances
@@ -176,6 +258,33 @@ export interface RetirementInputs {
   hysaRealReturnRatePct: number
   inflationRatePct: number
   socialSecurity: SocialSecurityInputs
+}
+
+// A dependent (e.g. a child) tracked for household-size and dependent-tax-
+// credit purposes — see RetirementInputs.dependents. Two independent age
+// cutoffs, since the real rules they model are legally distinct and often
+// differ in practice:
+//  - agesOffCoverageAt: counts toward ACA household size only while under
+//    this age (see age.ts's hasReachedAgeDuringYear) — modeled after the
+//    real ACA rule that an adult child can stay on a parent's health plan
+//    until 26, which is also this field's default for a newly added
+//    dependent.
+//  - taxDependentUntilAge: counts toward the Child Tax Credit/Credit for
+//    Other Dependents (see RetirementInputs.childTaxCreditAmount etc.) only
+//    while under this age. Real IRS dependency rules are more nuanced (a
+//    support test, student status, etc.) that this app doesn't model —
+//    defaults to 19, the general "qualifying child" age limit; raise it
+//    (e.g. to 24) for a full-time student, or higher still for a
+//    permanently disabled dependent or a "qualifying relative" with no age
+//    limit of its own. Optional for backward compatibility with dependents
+//    saved before this field existed — read as `?? 19` wherever it's
+//    consumed.
+export interface Dependent {
+  id: string
+  name: string
+  birthDate: string
+  agesOffCoverageAt: number
+  taxDependentUntilAge?: number
 }
 
 // Whether an owner's benefit is entered directly from their SSA statement, or
@@ -596,6 +705,25 @@ export interface DividendPolicyPlanRange extends PlanRangeBounds {
   policy: DividendPolicy
 }
 
+// One range of ACA marketplace health coverage — the actual premium paid
+// and the SLCSP benchmark premium the premium tax credit is sized against.
+// Like DividendPolicyPlanRange, at most one range may apply to a given year
+// — see findOverlappingRangeIds — since only one premium/benchmark pair
+// makes sense for a household in a given year.
+export interface AcaCoveragePlanRange extends PlanRangeBounds {
+  actualPremium: AmountSource
+  benchmarkPremium: AmountSource // SLCSP — second-lowest-cost Silver plan
+}
+
+// Federal poverty guideline as a household-size-1 base plus a flat
+// per-additional-person increment — the real HHS guideline genuinely is
+// linear across household sizes 1-8 (unlike, say, RMD divisors), so this
+// two-field struct is both simpler and more accurate than an editable list.
+export interface AcaFederalPovertyGuideline {
+  basePerson1: number
+  perAdditionalPerson: number
+}
+
 export interface ScenarioSummary {
   name: string
   updatedAt: string
@@ -638,6 +766,35 @@ const DEFAULT_FEDERAL_CAPITAL_GAINS_BRACKETS: TaxBracket[] = [
   { id: 'fed-cg-0', min: 0, ratePct: 0 },
   { id: 'fed-cg-15', min: 49_450, ratePct: 15 },
   { id: 'fed-cg-20', min: 545_500, ratePct: 20 },
+]
+
+// 2025 HHS federal poverty guideline (48 contiguous states + DC), used to
+// determine premium tax credit eligibility for 2026 marketplace coverage —
+// transcribed by hand, worth checking against aspe.hhs.gov before relying
+// on it.
+const DEFAULT_ACA_FEDERAL_POVERTY_GUIDELINE: AcaFederalPovertyGuideline = {
+  basePerson1: 15_650,
+  perAdditionalPerson: 5_500,
+}
+
+// The general "qualifying child" tax-dependency age limit — Dependent's own
+// fallback when taxDependentUntilAge is missing (a dependent saved before
+// that field existed) or unset on a newly added one.
+export const DEFAULT_TAX_DEPENDENT_UNTIL_AGE = 19
+
+// Pre-ARPA statutory applicable-percentage sliding scale (current law for
+// 2026+ coverage — the ARPA/IRA enhanced schedule, which had no 400%-FPL
+// cliff and capped contributions at 8.5%, expired 2025-12-31). `min` is a
+// percent of the federal poverty line, not a dollar amount — see
+// RetirementInputs.acaApplicablePercentageSchedule.
+const DEFAULT_ACA_APPLICABLE_PERCENTAGE_SCHEDULE: TaxBracket[] = [
+  { id: 'aca-100', min: 100, ratePct: 2.1 },
+  { id: 'aca-133', min: 133, ratePct: 3.14 },
+  { id: 'aca-150', min: 150, ratePct: 4.19 },
+  { id: 'aca-200', min: 200, ratePct: 6.6 },
+  { id: 'aca-250', min: 250, ratePct: 8.44 },
+  { id: 'aca-300', min: 300, ratePct: 9.96 },
+  { id: 'aca-400', min: 400, ratePct: 9.96 },
 ]
 
 const DEFAULT_RMD_START_AGE = 75
@@ -832,6 +989,7 @@ export const DEFAULT_INPUTS: RetirementInputs = {
   birthDate: defaultBirthDate(35),
   spouseEnabled: false,
   spouseBirthDate: defaultBirthDate(35),
+  dependents: [],
   lifeExpectancy: 95,
   federalTaxBrackets: DEFAULT_FEDERAL_TAX_BRACKETS,
   federalStandardDeduction: DEFAULT_FEDERAL_STANDARD_DEDUCTION,
@@ -840,6 +998,7 @@ export const DEFAULT_INPUTS: RetirementInputs = {
   stateTaxBrackets: [],
   stateStandardDeduction: 0,
   statePersonalExemption: 0,
+  statePersonalExemptionPerDependent: 0,
   stateBracketsInflationAdjusted: true,
   federalCapitalGainsBrackets: DEFAULT_FEDERAL_CAPITAL_GAINS_BRACKETS,
   stateHasSeparateCapitalGainsRates: false,
@@ -849,9 +1008,23 @@ export const DEFAULT_INPUTS: RetirementInputs = {
   medicareTaxRatePct: 1.45,
   additionalMedicareTaxRatePct: 0.9,
   additionalMedicareTaxThreshold: 200_000,
+  childTaxCreditQualifyingAge: 17,
+  childTaxCreditAmount: 2_200,
+  childTaxCreditRefundableAmount: 1_700,
+  childTaxCreditInflationAdjusted: true,
+  otherDependentCreditAmount: 500,
+  dependentCreditPhaseOutThresholdSingle: 200_000,
+  dependentCreditPhaseOutThresholdMFJ: 400_000,
+  dependentCreditPhaseOutRatePct: 5,
   rmdStartAge: DEFAULT_RMD_START_AGE,
   rmdDivisors: DEFAULT_RMD_DIVISORS,
   stateContributionDeductions: [],
+  acaCoverageRanges: [],
+  acaFederalPovertyGuideline: DEFAULT_ACA_FEDERAL_POVERTY_GUIDELINE,
+  acaFplInflationAdjusted: true,
+  acaApplicablePercentageSchedule: DEFAULT_ACA_APPLICABLE_PERCENTAGE_SCHEDULE,
+  acaCliffAt400Pct: true,
+  acaCapAbovePct400: 8.5,
   balances: {
     self: { ...EMPTY_OWNED_BALANCES },
     spouse: { ...EMPTY_OWNED_BALANCES },

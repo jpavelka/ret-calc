@@ -122,6 +122,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
       federalStandardDeduction: d(row.taxDeductions.federalStandardDeduction),
       stateStandardDeduction: d(row.taxDeductions.stateStandardDeduction),
       statePersonalExemption: d(row.taxDeductions.statePersonalExemption),
+      statePersonalExemptionPerDependent: d(row.taxDeductions.statePersonalExemptionPerDependent),
       stateContributionDeduction: d(row.taxDeductions.stateContributionDeduction),
     },
     federalTax: d(row.federalTax),
@@ -204,6 +205,30 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
     hysaInterest: d(row.hysaInterest),
     dividendIncome: d(row.dividendIncome),
     netWorth: d(row.netWorth),
+    magi: d(row.magi),
+    aca: row.aca
+      ? {
+          ...row.aca,
+          // householdSize/fplPct/applicablePct are counts/percentages, not
+          // dollar amounts — left as-is.
+          magi: d(row.aca.magi),
+          fpl: d(row.aca.fpl),
+          expectedContribution: d(row.aca.expectedContribution),
+          benchmarkPremium: d(row.aca.benchmarkPremium),
+          actualPremium: d(row.aca.actualPremium),
+          premiumTaxCredit: d(row.aca.premiumTaxCredit),
+          netPremium: d(row.aca.netPremium),
+        }
+      : null,
+    dependentCredit: {
+      ...row.dependentCredit,
+      // qualifyingChildCount/otherDependentCount are counts, not dollars.
+      grossCredit: d(row.dependentCredit.grossCredit),
+      phaseOutReduction: d(row.dependentCredit.phaseOutReduction),
+      creditAfterPhaseOut: d(row.dependentCredit.creditAfterPhaseOut),
+      nonRefundableApplied: d(row.dependentCredit.nonRefundableApplied),
+      refundableCredit: d(row.dependentCredit.refundableCredit),
+    },
   }
 }
 
@@ -624,8 +649,9 @@ function bracketRows(entries: BracketBreakdownEntry[]): BreakdownRow[] {
 // (the true 1040-style figure) because row.adjustedOrdinary itself excludes
 // capital gains/dividends, which are taxed separately via a stacked bracket
 // schedule (see tax.ts's scheduleTax), and its own adjustments are exactly
-// pre-tax contributions, HSA contributions, and the non-taxable share of
-// Social Security. MAGI (as used for IRMAA/ACA/Roth-eligibility purposes)
+// pre-tax contributions, HSA contributions, pre-tax spending deductions
+// (e.g. Section 125 health premiums), and the non-taxable share of Social
+// Security. MAGI (as used for IRMAA/ACA/Roth-eligibility purposes)
 // adds that untaxed Social Security share back on top of AGI. Federal and
 // state AGI can differ only in how much of Social Security each one taxes
 // (most states don't tax it at all), so State restates its own AGI from
@@ -706,10 +732,17 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   if (row.hsaSavingsContributions > 0) {
     rows.push({ label: '− HSA contributions', amount: row.hsaSavingsContributions })
   }
+  if (row.preTaxSpendingDeductions > 0) {
+    rows.push({ label: '− Pre-tax payroll deductions', amount: row.preTaxSpendingDeductions })
+  }
   if (nonTaxableSocialSecurityFederal > 0) {
     rows.push({ label: '− Non-taxable Social Security', amount: nonTaxableSocialSecurityFederal })
   }
-  const totalAdjustments = nonTaxableSocialSecurityFederal + row.hsaSavingsContributions + row.preTaxSavingsDeferrals
+  const totalAdjustments =
+    nonTaxableSocialSecurityFederal +
+    row.hsaSavingsContributions +
+    row.preTaxSavingsDeferrals +
+    row.preTaxSpendingDeductions
   rows.push({ label: 'Total adjustments', amount: totalAdjustments, derived: true })
   const totalIncomeAllSources = totalOrdinaryIncomeSources + totalCapitalGains
   rows.push({
@@ -734,8 +767,13 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
     rows.push({ label: '+ Non-taxable Social Security', amount: nonTaxableSocialSecurityFederal })
   }
   rows.push({
+    // Reads row.magi directly (computed once in projection.ts, the same
+    // figure ACA/IRMAA/Roth-eligibility math uses) rather than recomputing
+    // totalIncomeAllSources - totalAdjustments + nonTaxableSocialSecurityFederal
+    // inline, which omitted preTaxSpendingTotal (e.g. Section 125 health
+    // premiums) and so overstated MAGI whenever such a spending line existed.
     label: 'Modified AGI (MAGI)',
-    amount: totalIncomeAllSources - totalAdjustments + nonTaxableSocialSecurityFederal,
+    amount: row.magi,
     derived: true,
   })
 
@@ -771,6 +809,7 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   const stateDeductionTotal =
     row.taxDeductions.stateStandardDeduction +
     row.taxDeductions.statePersonalExemption +
+    row.taxDeductions.statePersonalExemptionPerDependent +
     row.taxDeductions.stateContributionDeduction
   const unusedStateDeduction = Math.max(0, stateDeductionTotal - stateAgi)
 
@@ -780,6 +819,12 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   rows.push({ label: '− Standard deduction', amount: row.taxDeductions.stateStandardDeduction })
   if (row.taxDeductions.statePersonalExemption > 0) {
     rows.push({ label: '− Personal exemption', amount: row.taxDeductions.statePersonalExemption })
+  }
+  if (row.taxDeductions.statePersonalExemptionPerDependent > 0) {
+    rows.push({
+      label: '− Personal exemption (per dependent)',
+      amount: row.taxDeductions.statePersonalExemptionPerDependent,
+    })
   }
   if (row.taxDeductions.stateContributionDeduction > 0) {
     rows.push({ label: '− 529 contribution deduction', amount: row.taxDeductions.stateContributionDeduction })
@@ -805,8 +850,46 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   if (row.earlyWithdrawalPenalty > 0) {
     rows.push({ label: 'Early withdrawal penalty', amount: row.earlyWithdrawalPenalty })
   }
+  const dc = row.dependentCredit
+  if (dc.qualifyingChildCount > 0 || dc.otherDependentCount > 0) {
+    rows.push({ label: 'Dependent credits', header: true })
+    rows.push({ label: `Qualifying children: ${dc.qualifyingChildCount}` })
+    rows.push({ label: `Other dependents: ${dc.otherDependentCount}` })
+    rows.push({ label: 'Gross credit', amount: dc.grossCredit })
+    if (dc.phaseOutReduction > 0) {
+      rows.push({ label: '− Phase-out (income above threshold)', amount: dc.phaseOutReduction })
+    }
+    rows.push({ label: 'Credit after phase-out', amount: dc.creditAfterPhaseOut, derived: true })
+    if (dc.nonRefundableApplied > 0) {
+      rows.push({ label: '− Applied against federal tax', amount: dc.nonRefundableApplied })
+    }
+    if (dc.refundableCredit > 0) {
+      rows.push({ label: '− Refunded (Additional Child Tax Credit)', amount: dc.refundableCredit })
+    }
+  }
   rows.push({ label: 'Total', amount: row.totalTax, derived: true, section: true })
   return rows
+}
+
+// FPL%/applicable% are percentages, not dollars — BreakdownRow.amount is
+// currency-only (see BreakdownList's rendering), so these are baked into the
+// label text as plain rows rather than misformatted as a dollar amount.
+function acaBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
+  if (!row.aca) {
+    return [{ label: 'Not ACA-eligible this year (65+, or no coverage range active)', derived: true }]
+  }
+  const a = row.aca
+  return [
+    { label: 'MAGI', amount: a.magi, derived: true },
+    { label: `Federal poverty line (household of ${a.householdSize})`, amount: a.fpl },
+    { label: `Income as % of FPL: ${a.fplPct.toFixed(0)}%`, derived: true },
+    { label: `Applicable % of income: ${a.applicablePct.toFixed(2)}%`, derived: true },
+    { label: 'Expected contribution', amount: a.expectedContribution, derived: true },
+    { label: 'Benchmark premium (SLCSP)', amount: a.benchmarkPremium },
+    { label: 'Actual premium', amount: a.actualPremium },
+    { label: 'Premium tax credit', amount: a.premiumTaxCredit, derived: true, section: true },
+    { label: 'Net premium (added to cash need)', amount: a.netPremium, derived: true },
+  ]
 }
 
 // Sums each investment account's contributions/withdrawals/growth into one
@@ -867,6 +950,9 @@ function accountRows(
 
 // Each numeric column got a little wider than Basic's equivalent to make
 // room for the CellHelp "?" glyph next to the value without wrapping.
+// Order matches the <thead>/<tbody> columns below: Income, Social Security,
+// Expenses, Savings, Match, Taxes, ACA premium, Pre-tax, Roth, Taxable, HSA,
+// 529, HYSA, Cash, Net worth.
 const standardColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   YEAR_COL_WIDTH,
   ageColWidth(spouseEnabled),
@@ -877,6 +963,7 @@ const standardColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   116,
   116,
   116,
+  126,
   126,
   126,
   126,
@@ -955,6 +1042,7 @@ function StandardTable({
             <th className="py-2 pr-3 text-right">Savings</th>
             <th className="py-2 pr-3 text-right">Match</th>
             <th className="py-2 pr-3 text-right">Taxes</th>
+            <th className="py-2 pr-3 text-right">ACA premium</th>
             <th className="py-2 pr-3 text-right">Pre-tax</th>
             <th className="py-2 pr-3 text-right">Roth</th>
             <th className="py-2 pr-3 text-right">Taxable</th>
@@ -1125,6 +1213,9 @@ function StandardTable({
                 </ValueCell>
                 <ValueCell value={`$${fmt(row.totalTax)}`} label="Taxes" width={320}>
                   <BreakdownList rows={taxBreakdownRows(row)} />
+                </ValueCell>
+                <ValueCell value={`$${fmt(row.aca?.netPremium ?? 0)}`} label="ACA premium" width={280}>
+                  <BreakdownList rows={acaBreakdownRows(row)} />
                 </ValueCell>
                 <ValueCell
                   value={`$${fmt(row.balances.preTaxSelf + row.balances.preTaxSpouse)}`}
