@@ -40,6 +40,7 @@ import { FunctionsEditor } from './FunctionsEditor'
 import { GoalsEditor } from './GoalsEditor'
 import { HelpTooltip } from './HelpTooltip'
 import { IncomeRangesEditor } from './IncomeRangesEditor'
+import { IrmaaTiersEditor } from './IrmaaTiersEditor'
 import { MetricsEditor } from './MetricsEditor'
 import { NumberField } from './NumberField'
 import { accountBalanceSnapshot, totalNetWorth, type YearProjectionRow } from './projection'
@@ -1418,6 +1419,63 @@ export function InputsForm({ inputs, onChange, projectionRows, simulationRuns }:
                 mode={yearMode}
                 history={formulaHistory}
                 functions={functionsContext}
+              />
+            </div>
+          </div>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        id="irmaa"
+        title={
+          <>
+            Medicare IRMAA
+            <HelpTooltip text="Income-related surcharge on Medicare Part B and Part D premiums, for each person 65 or older. Based on MAGI from two years earlier, so a Roth conversion or large gain this year raises premiums two years from now. The standard Part B/D premiums themselves are not modeled — enter those as spending — only the surcharge on top." />
+          </>
+        }
+      >
+        <div className="flex flex-col gap-5">
+          <div>
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
+              Income before the projection
+              <HelpTooltip text="Your first two projection years have no projected MAGI two years back, so enter the MAGI from the two years before this year (the adjusted gross income on your tax return plus tax-exempt interest). Leave at 0 to assume no surcharge from those years." />
+            </h3>
+            <div className="mt-2 flex flex-wrap gap-4">
+              <div className="w-44">
+                <CurrencyField
+                  label="MAGI two years before start"
+                  min={0}
+                  value={inputs.irmaaMagiTwoYearsBeforeStart}
+                  onChange={(irmaaMagiTwoYearsBeforeStart) => onChange({ ...inputs, irmaaMagiTwoYearsBeforeStart })}
+                />
+              </div>
+              <div className="w-44">
+                <CurrencyField
+                  label="MAGI one year before start"
+                  min={0}
+                  value={inputs.irmaaMagiOneYearBeforeStart}
+                  onChange={(irmaaMagiOneYearBeforeStart) => onChange({ ...inputs, irmaaMagiOneYearBeforeStart })}
+                />
+              </div>
+            </div>
+          </div>
+          <div>
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-600">
+              Surcharge tiers
+              <HelpTooltip text="A person whose MAGI is above a tier's threshold pays that tier's monthly surcharge (the highest tier exceeded applies). Joint thresholds are used whenever spouse mode is on. Defaults are the 2026 CMS figures; the Part B amount is the surcharge above the $202.90 standard premium. Filing-separately thresholds aren't modeled." />
+            </h3>
+            <div className="mt-2">
+              <IrmaaTiersEditor
+                tiers={inputs.irmaaTiers}
+                onChange={(irmaaTiers) => onChange({ ...inputs, irmaaTiers })}
+              />
+            </div>
+            <div className="mt-2">
+              <CheckboxField
+                label="Thresholds and surcharges keep pace with inflation"
+                checked={inputs.irmaaInflationAdjusted}
+                onChange={(irmaaInflationAdjusted) => onChange({ ...inputs, irmaaInflationAdjusted })}
+                help="IRMAA thresholds are indexed to inflation by law, and the surcharge amounts follow Part B/D premiums, which rise roughly with it. On by default."
               />
             </div>
           </div>

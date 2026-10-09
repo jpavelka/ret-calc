@@ -166,6 +166,9 @@ export interface WithdrawalPlan {
   taxableBasisUsed: number
   rothBasisUsed: { self: number; spouse: number }
   college529BasisUsed: number
+  // The subset of the 529 draw that covered qualified education expenses —
+  // fully tax- and penalty-free, regardless of the basis/earnings split.
+  college529Qualified: number
   // The remainder once every account is empty, which drives cash negative.
   unfunded: number
   // How much of byAccount.preTaxSelf/preTaxSpouse was the mandatory RMD
@@ -276,6 +279,7 @@ export function planWithdrawals(
   let taxableBasisUsed = 0
   const rothBasisUsed = { self: 0, spouse: 0 }
   let college529BasisUsed = 0
+  let college529Qualified = 0
   const rmd = { self: 0, spouse: 0 }
 
   // Required minimum distributions — mandatory regardless of `need`, and
@@ -410,6 +414,7 @@ export function planWithdrawals(
         const qualified = Math.min(take, remainingQualifiedEducation)
         const nonQualified = take - qualified
         remainingQualifiedEducation -= qualified
+        college529Qualified += qualified
         const nonQualifiedEarnings = nonQualified * (1 - college529BasisFraction)
         ordinaryIncome += nonQualifiedEarnings
         ordinaryIncomeByAccount.college529 += nonQualifiedEarnings
@@ -448,6 +453,7 @@ export function planWithdrawals(
     taxableBasisUsed,
     rothBasisUsed,
     college529BasisUsed,
+    college529Qualified,
     unfunded,
     rmd,
   }

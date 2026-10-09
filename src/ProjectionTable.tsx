@@ -4,6 +4,7 @@ import { HelpTooltip } from './HelpTooltip'
 import { savingsLineKey } from './projection'
 import type { AccountFlow, InvestmentAccountKey, YearlyRates, YearProjectionRow } from './projection'
 import { nominalReturnPct } from './simulation'
+import { CURRENT_YEAR_SPECIAL_NAME, DEATH_YEAR_SPECIAL_NAME } from './specialYearGraph'
 import type { BracketBreakdownEntry } from './tax'
 import type { DividendPolicy, RetirementInputs } from './types'
 
@@ -175,6 +176,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
         spouse: d(row.withdrawals.rothBasisUsed.spouse),
       },
       college529BasisUsed: d(row.withdrawals.college529BasisUsed),
+      college529Qualified: d(row.withdrawals.college529Qualified),
     },
     balances: {
       preTaxSelf: d(row.balances.preTaxSelf),
@@ -206,6 +208,15 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
     dividendIncome: d(row.dividendIncome),
     netWorth: d(row.netWorth),
     magi: d(row.magi),
+    irmaa: row.irmaa
+      ? {
+          ...row.irmaa,
+          lookbackMagi: d(row.irmaa.lookbackMagi),
+          partBPerPerson: d(row.irmaa.partBPerPerson),
+          partDPerPerson: d(row.irmaa.partDPerPerson),
+          total: d(row.irmaa.total),
+        }
+      : null,
     aca: row.aca
       ? {
           ...row.aca,
@@ -253,7 +264,7 @@ function deflateRow(row: YearProjectionRow, factor: number): YearProjectionRow {
 // here reads as one big empty channel between Age and the data.
 // "2026" is ~34px at text-sm; "100 / 100" (the widest age label there can be)
 // is ~64px, while a solo age never exceeds three digits.
-const YEAR_COL_WIDTH = 52
+const YEAR_COL_WIDTH = 64
 const ageColWidth = (spouseEnabled: boolean) => (spouseEnabled ? 80 : 52)
 
 const STICKY_YEAR_STYLE = { position: 'sticky', left: 0 } as const
@@ -275,6 +286,7 @@ export function ProjectionTable({ rows, inputs, rates }: ProjectionTableProps) {
 
   const active = LEVELS.find((l) => l.id === level) ?? LEVELS[1]
   const simulatedFactors = rates ? simulatedRealDollarFactors(rates) : null
+  const yearLabels = specialYearLabels(rows, inputs)
   const displayRows =
     dollarMode === 'real'
       ? rows.map((row, i) =>
@@ -345,11 +357,12 @@ export function ProjectionTable({ rows, inputs, rates }: ProjectionTableProps) {
 
       <div className="mt-4">
         {level === 'basic' && (
-          <BasicTable rows={displayRows} spouseEnabled={inputs.spouseEnabled} rates={rates} />
+          <BasicTable rows={displayRows} yearLabels={yearLabels} spouseEnabled={inputs.spouseEnabled} rates={rates} />
         )}
         {level === 'standard' && (
           <StandardTable
             rows={displayRows}
+            yearLabels={yearLabels}
             spouseEnabled={inputs.spouseEnabled}
             rates={rates}
             ssThresholds={
@@ -359,7 +372,7 @@ export function ProjectionTable({ rows, inputs, rates }: ProjectionTableProps) {
             }
           />
         )}
-        {level === 'detailed' && <DetailedTable rows={displayRows} inputs={inputs} rates={rates} />}
+        {level === 'detailed' && <DetailedTable rows={displayRows} yearLabels={yearLabels} inputs={inputs} rates={rates} />}
       </div>
     </div>
   )
@@ -385,8 +398,9 @@ export function ProjectionSectionHeading() {
           'not cost basis. Pre-tax withdrawals are ordinary income. Roth comes out basis ' +
           'first, and once the owner reaches 59½ the earnings are tax-free too; before that ' +
           'they are ordinary income. HSA withdrawals beyond that year’s medical-related ' +
-          'spending are ordinary income. 529 withdrawals beyond that year’s education-related ' +
-          'spending have their earnings share taxed as ordinary income plus a flat 10% ' +
+          'spending are ordinary income. 529 withdrawals up to that year’s education-related ' +
+          'spending are fully tax- and penalty-free, whatever the basis split; beyond that, the ' +
+          'withdrawal’s earnings share is taxed as ordinary income plus a flat 10% ' +
           'federal penalty, with no age exemption. Withdrawing ' +
           'pre-tax or Roth before 59½ adds a 10% penalty (20% on an HSA before 65) — the whole ' +
           'year counts as penalty-free once the birthday falls in it. If every account runs dry ' +
@@ -424,12 +438,44 @@ const basicColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   120,
 ]
 
+// Maps each calendar year to the names of the special years landing on it —
+// stored ones plus the built-in "Current year" and "Death year" (the last
+// projected row) — so a table row can flag itself.
+function specialYearLabels(rows: YearProjectionRow[], inputs: RetirementInputs): Map<number, string[]> {
+  const byYear = new Map<number, string[]>()
+  const add = (year: number, name: string) => byYear.set(year, [...(byYear.get(year) ?? []), name])
+  add(new Date().getFullYear(), CURRENT_YEAR_SPECIAL_NAME)
+  if (rows.length > 0) add(rows[rows.length - 1].year, DEATH_YEAR_SPECIAL_NAME)
+  for (const sy of inputs.specialYears) add(sy.year, sy.name)
+  return byYear
+}
+
+// The Year cell's content: the year, plus a "?"-style popup naming any
+// special years that fall on it.
+function YearCell({ year, labels }: { year: number; labels?: string[] }) {
+  if (!labels || labels.length === 0) return <>{year}</>
+  return (
+    <span className="inline-flex items-center gap-1">
+      {year}
+      <CellHelp label={`${year} is a special year`}>
+        <ul className="list-disc pl-4">
+          {labels.map((name) => (
+            <li key={name}>{name}</li>
+          ))}
+        </ul>
+      </CellHelp>
+    </span>
+  )
+}
+
 function BasicTable({
   rows,
+  yearLabels,
   spouseEnabled,
   rates,
 }: {
   rows: YearProjectionRow[]
+  yearLabels: Map<number, string[]>
   spouseEnabled: boolean
   rates?: YearlyRates[]
 }) {
@@ -470,7 +516,7 @@ function BasicTable({
           {rows.map((row, i) => (
             <tr key={row.year} className="border-b border-slate-100">
               <td className={`py-1.5 pr-3 font-medium text-slate-700 ${STICKY_YEAR_CLASS}`} style={STICKY_YEAR_STYLE}>
-                {row.year}
+                <YearCell year={row.year} labels={yearLabels.get(row.year)} />
               </td>
               <td className={`py-1.5 pr-3 text-slate-500 ${STICKY_AGE_CLASS}`} style={STICKY_AGE_STYLE}>
                 {ageLabel(row, spouseEnabled)}
@@ -874,6 +920,20 @@ function taxBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
 // FPL%/applicable% are percentages, not dollars — BreakdownRow.amount is
 // currency-only (see BreakdownList's rendering), so these are baked into the
 // label text as plain rows rather than misformatted as a dollar amount.
+function healthPremiumBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
+  const aca = acaBreakdownRows(row)
+  const i = row.irmaa
+  if (!i) return aca
+  return [
+    ...aca,
+    { label: 'Medicare IRMAA (Part B + D surcharge)', section: true },
+    { label: `MAGI from two years ago (IRMAA tier ${i.tier})`, amount: i.lookbackMagi },
+    { label: `Part B surcharge × ${i.medicareCount}`, amount: i.partBPerPerson * i.medicareCount },
+    { label: `Part D surcharge × ${i.medicareCount}`, amount: i.partDPerPerson * i.medicareCount },
+    { label: 'IRMAA total (added to cash need)', amount: i.total, derived: true },
+  ]
+}
+
 function acaBreakdownRows(row: YearProjectionRow): BreakdownRow[] {
   if (!row.aca) {
     return [{ label: 'Not ACA-eligible this year (65+, or no coverage range active)', derived: true }]
@@ -951,7 +1011,7 @@ function accountRows(
 // Each numeric column got a little wider than Basic's equivalent to make
 // room for the CellHelp "?" glyph next to the value without wrapping.
 // Order matches the <thead>/<tbody> columns below: Income, Social Security,
-// Expenses, Savings, Match, Taxes, ACA premium, Pre-tax, Roth, Taxable, HSA,
+// Expenses, Savings, Match, Taxes, Health premium, Pre-tax, Roth, Taxable, HSA,
 // 529, HYSA, Cash, Net worth.
 const standardColWidths = (spouseEnabled: boolean, showRates: boolean) => [
   YEAR_COL_WIDTH,
@@ -1006,11 +1066,13 @@ function ValueCell({
 
 function StandardTable({
   rows,
+  yearLabels,
   spouseEnabled,
   rates,
   ssThresholds,
 }: {
   rows: YearProjectionRow[]
+  yearLabels: Map<number, string[]>
   spouseEnabled: boolean
   rates?: YearlyRates[]
   // Provisional-income thresholds for the Social Security breakdown popup —
@@ -1042,7 +1104,7 @@ function StandardTable({
             <th className="py-2 pr-3 text-right">Savings</th>
             <th className="py-2 pr-3 text-right">Match</th>
             <th className="py-2 pr-3 text-right">Taxes</th>
-            <th className="py-2 pr-3 text-right">ACA premium</th>
+            <th className="py-2 pr-3 text-right">Health premium</th>
             <th className="py-2 pr-3 text-right">Pre-tax</th>
             <th className="py-2 pr-3 text-right">Roth</th>
             <th className="py-2 pr-3 text-right">Taxable</th>
@@ -1098,14 +1160,47 @@ function StandardTable({
             )
 
             const hsaRows = accountRows('HSA', row.accountFlows.hsa, row.balances.hsa)
+            // Same idea as the 529: draws covering medical spending are tax-free;
+            // only the remainder is ordinary income (plus a penalty before 65).
+            const hsaWithdrawn = row.accountFlows.hsa.withdrawals
+            if (hsaWithdrawn > 0) {
+              const nonQualified = row.withdrawals.ordinaryIncomeByAccount.hsa
+              const qualified = hsaWithdrawn - nonQualified
+              const at = hsaRows.findIndex((r) => r.label === 'Withdrawals') + 1
+              const split: BreakdownRow[] = []
+              if (qualified > 0) {
+                split.push({ label: 'Of which qualified medical (tax-free)', amount: qualified, sub: true })
+              }
+              if (nonQualified > 0) {
+                split.push({ label: 'Of which non-qualified (taxed)', amount: nonQualified, sub: true })
+              }
+              hsaRows.splice(at, 0, ...split)
+            }
 
             const college529Rows = accountRows(
               '529',
               row.accountFlows.college529,
               row.balances.college529,
               row.balances.college529Basis,
-              row.accountFlows.college529.withdrawals > 0 ? row.withdrawals.college529BasisUsed : undefined,
             )
+            // Qualified education draws are fully tax- and penalty-free, so the
+            // basis/earnings split only matters for the non-qualified remainder.
+            const college529Withdrawn = row.accountFlows.college529.withdrawals
+            if (college529Withdrawn > 0) {
+              const qualified = row.withdrawals.college529Qualified
+              const nonQualified = college529Withdrawn - qualified
+              const at = college529Rows.findIndex((r) => r.label === 'Withdrawals') + 1
+              const split: BreakdownRow[] = []
+              if (qualified > 0) {
+                split.push({ label: 'Of which qualified education (tax-free)', amount: qualified, sub: true })
+              }
+              if (nonQualified > 0) {
+                const earnings = row.withdrawals.ordinaryIncomeByAccount.college529
+                split.push({ label: 'Of which non-qualified: basis (tax-free)', amount: nonQualified - earnings, sub: true })
+                split.push({ label: 'Of which non-qualified: earnings (taxed + 10%)', amount: earnings, sub: true })
+              }
+              college529Rows.splice(at, 0, ...split)
+            }
 
             const hysaRows = accountRows('HYSA', row.accountFlows.hysa, row.balances.hysa)
 
@@ -1133,7 +1228,7 @@ function StandardTable({
             return (
               <tr key={row.year} className="border-b border-slate-100">
                 <td className={`py-1.5 pr-3 font-medium text-slate-700 ${STICKY_YEAR_CLASS}`} style={STICKY_YEAR_STYLE}>
-                  {row.year}
+                  <YearCell year={row.year} labels={yearLabels.get(row.year)} />
                 </td>
                 <td className={`py-1.5 pr-3 text-slate-500 ${STICKY_AGE_CLASS}`} style={STICKY_AGE_STYLE}>
                   {ageLabel(row, spouseEnabled)}
@@ -1214,8 +1309,12 @@ function StandardTable({
                 <ValueCell value={`$${fmt(row.totalTax)}`} label="Taxes" width={320}>
                   <BreakdownList rows={taxBreakdownRows(row)} />
                 </ValueCell>
-                <ValueCell value={`$${fmt(row.aca?.netPremium ?? 0)}`} label="ACA premium" width={280}>
-                  <BreakdownList rows={acaBreakdownRows(row)} />
+                <ValueCell
+                  value={`$${fmt((row.aca?.netPremium ?? 0) + (row.irmaa?.total ?? 0))}`}
+                  label="Health premium"
+                  width={280}
+                >
+                  <BreakdownList rows={healthPremiumBreakdownRows(row)} />
                 </ValueCell>
                 <ValueCell
                   value={`$${fmt(row.balances.preTaxSelf + row.balances.preTaxSpouse)}`}
@@ -1361,11 +1460,13 @@ function GroupSubHeaderRow({ groups }: { groups: ColumnGroup[] }) {
 
 function DetailedTable({
   rows,
+  yearLabels,
   inputs,
   rates,
 }: {
   rows: YearProjectionRow[]
   inputs: RetirementInputs
+  yearLabels: Map<number, string[]>
   rates?: YearlyRates[]
 }) {
   const spouseEnabled = inputs.spouseEnabled
@@ -1749,7 +1850,7 @@ function DetailedTable({
             return (
               <tr key={row.year} className="border-b border-slate-100">
                 <td className={`py-1 pr-3 font-medium text-slate-700 ${STICKY_YEAR_CLASS}`} style={STICKY_YEAR_STYLE}>
-                  {row.year}
+                  <YearCell year={row.year} labels={yearLabels.get(row.year)} />
                 </td>
                 <td className={`py-1 pr-3 text-slate-500 ${STICKY_AGE_CLASS}`} style={STICKY_AGE_STYLE}>
                   {ageLabel(row, spouseEnabled)}

@@ -196,6 +196,21 @@ export interface RetirementInputs {
   // so this is left as an editable assumption rather than hard-coded.
   acaCliffAt400Pct: boolean
   acaCapAbovePct400: number
+  // Medicare IRMAA (income-related monthly adjustment amount): a surcharge
+  // on top of the standard Part B/Part D premiums for each person on
+  // Medicare (modeled as everyone who has reached 65 during the year, full
+  // year, same simplification as ACA eligibility). Based on MAGI from TWO
+  // years earlier — year N's surcharge is read off year N-2's MAGI. For the
+  // first two projection years there is no projected MAGI to look back at,
+  // so these two figures stand in: the MAGI from two and one years before
+  // the projection's first year. 0 means no surcharge from that year.
+  irmaaMagiTwoYearsBeforeStart: number
+  irmaaMagiOneYearBeforeStart: number
+  irmaaTiers: IrmaaTier[]
+  // Thresholds are indexed to inflation by law; the surcharge dollar amounts
+  // track the Part B/D premiums, which rise roughly with it. On by default,
+  // same convention as federalBracketsInflationAdjusted. Both are scaled.
+  irmaaInflationAdjusted: boolean
   balances: {
     self: OwnedAccountBalances
     spouse: OwnedAccountBalances
@@ -724,6 +739,19 @@ export interface AcaFederalPovertyGuideline {
   perAdditionalPerson: number
 }
 
+// One IRMAA surcharge tier. A person whose lookback MAGI is above the tier's
+// threshold (single, or married-filing-jointly when spouse mode is on) pays
+// this monthly surcharge, per person, on top of the standard Part B premium
+// and Part D plan premium — the highest tier exceeded applies, they don't
+// stack. MAGI at or below the lowest tier's threshold pays no surcharge.
+export interface IrmaaTier {
+  id: string
+  minMagiSingle: number
+  minMagiMFJ: number
+  partBSurchargeMonthly: number
+  partDSurchargeMonthly: number
+}
+
 export interface ScenarioSummary {
   name: string
   updatedAt: string
@@ -795,6 +823,19 @@ const DEFAULT_ACA_APPLICABLE_PERCENTAGE_SCHEDULE: TaxBracket[] = [
   { id: 'aca-250', min: 250, ratePct: 8.44 },
   { id: 'aca-300', min: 300, ratePct: 9.96 },
   { id: 'aca-400', min: 400, ratePct: 9.96 },
+]
+
+// 2026 Medicare IRMAA tiers (CMS, announced 2025-11-14; SSA POMS HI 01101.020).
+// The Part B figures are the surcharge above the $202.90 standard premium
+// (the tier's total premium minus that), and Part D is the amount added to
+// the plan premium. Brackets are keyed to MAGI from two years earlier, and
+// the filing-separately schedule isn't modeled.
+const DEFAULT_IRMAA_TIERS: IrmaaTier[] = [
+  { id: 'irmaa-1', minMagiSingle: 109_000, minMagiMFJ: 218_000, partBSurchargeMonthly: 81.2, partDSurchargeMonthly: 14.5 },
+  { id: 'irmaa-2', minMagiSingle: 137_000, minMagiMFJ: 274_000, partBSurchargeMonthly: 202.9, partDSurchargeMonthly: 37.5 },
+  { id: 'irmaa-3', minMagiSingle: 171_000, minMagiMFJ: 342_000, partBSurchargeMonthly: 324.6, partDSurchargeMonthly: 60.4 },
+  { id: 'irmaa-4', minMagiSingle: 205_000, minMagiMFJ: 410_000, partBSurchargeMonthly: 446.3, partDSurchargeMonthly: 83.3 },
+  { id: 'irmaa-5', minMagiSingle: 500_000, minMagiMFJ: 750_000, partBSurchargeMonthly: 487, partDSurchargeMonthly: 91 },
 ]
 
 const DEFAULT_RMD_START_AGE = 75
@@ -1025,6 +1066,10 @@ export const DEFAULT_INPUTS: RetirementInputs = {
   acaApplicablePercentageSchedule: DEFAULT_ACA_APPLICABLE_PERCENTAGE_SCHEDULE,
   acaCliffAt400Pct: true,
   acaCapAbovePct400: 8.5,
+  irmaaMagiTwoYearsBeforeStart: 0,
+  irmaaMagiOneYearBeforeStart: 0,
+  irmaaTiers: DEFAULT_IRMAA_TIERS,
+  irmaaInflationAdjusted: true,
   balances: {
     self: { ...EMPTY_OWNED_BALANCES },
     spouse: { ...EMPTY_OWNED_BALANCES },

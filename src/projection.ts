@@ -5,6 +5,8 @@ import { bracketBreakdown, computeDependentCredit, computeIncomeTaxes, prepareTa
 import type { BracketBreakdownEntry, DependentCreditConfig, DependentCreditResult } from './tax'
 import { computePtc } from './aca'
 import type { AcaPtcResult } from './aca'
+import { computeIrmaa } from './irmaa'
+import type { IrmaaResult } from './irmaa'
 import { FormulaError, tryEvaluateFormula, tryEvaluateCondition } from './formula'
 import type { AccountHistoryKey, FormulaFunctionsContext, FormulaHistoryContext } from './formula'
 import { buildFormulaFunctions } from './functions'
@@ -220,6 +222,7 @@ export interface YearProjectionRow {
     taxableBasisUsed: number
     rothBasisUsed: { self: number; spouse: number }
     college529BasisUsed: number
+    college529Qualified: number
   }
   // False if the gross-up solver hit its iteration cap without settling, which
   // needs tax rates summing past 100% to happen.
@@ -303,6 +306,14 @@ export interface YearProjectionRow {
     premiumTaxCredit: number
     netPremium: number
   } | null
+
+  // Medicare IRMAA surcharge for this year (Part B + Part D, across everyone
+  // on Medicare) — null when nobody is 65+ yet. `total` is already folded
+  // into this year's cash need/withdrawals; the rest is display-only. The
+  // surcharge is read off MAGI from two years earlier (lookbackMagi), so —
+  // unlike ACA — it doesn't depend on this year's withdrawals and adds no
+  // solver circularity.
+  irmaa: IrmaaResult | null
 
   // Federal Child Tax Credit + Credit for Other Dependents for this year —
   // present even when both counts are 0 (unlike `aca` above, there's no
@@ -1114,7 +1125,7 @@ function applyContribution(
 //
 // Not modelled, and worth knowing before trusting a long projection: the net
 // investment income tax, Social Security provisional-income taxability,
-// IRMAA, capital-loss carryforwards, and the 5-year Roth clock. The savings
+// capital-loss carryforwards, and the 5-year Roth clock. The savings
 // plan is also funded before the waterfall runs, so a shortfall year can
 // contribute to an account and immediately draw it back out.
 export function runProjection(
@@ -1240,6 +1251,14 @@ export function runProjection(
   // whole projection has run (see buildGoalProjectionLookups), so it isn't
   // bounded by these maps at all.
   const inflationFactorByYear = new Map<number, number>()
+  // MAGI (IRMAA definition) indexed by the projection year it will be looked
+  // back from: [0] feeds the first year's surcharge, [1] the second's, and
+  // each simulated year appends its own, which then feeds year+2. Seeded with
+  // the two pre-projection figures the user enters.
+  const irmaaLookbackMagi: number[] = [
+    finiteOr(inputs.irmaaMagiTwoYearsBeforeStart, 0),
+    finiteOr(inputs.irmaaMagiOneYearBeforeStart, 0),
+  ]
   const rmdByYear = new Map<number, number>()
   const rmdByAge = new Map<number, number>()
   const rmdBySpouseAge = new Map<number, number>()
@@ -1771,6 +1790,33 @@ export function runProjection(
     // scaled (percentages of FPL%, not dollars).
     const acaApplicableSchedule = [...inputs.acaApplicablePercentageSchedule].sort((a, b) => a.min - b.min)
 
+    // --- Medicare IRMAA surcharge ---
+    // Looks back two years, so it's fixed before the solver runs. The first
+    // two projection years read the user-entered pre-projection MAGIs; later
+    // years read the IRMAA-definition MAGI recorded for year-2. That MAGI is
+    // AGI (otherAGI plus TAXABLE Social Security) — unlike the ACA/`magi`
+    // figure, untaxed Social Security isn't added back.
+    const selfOnMedicare = hasReachedAgeDuringYear(inputs.birthDate, 65, year)
+    const spouseOnMedicare = inputs.spouseEnabled && hasReachedAgeDuringYear(spousePenaltyBirthDate, 65, year)
+    const medicareCount = (selfOnMedicare ? 1 : 0) + (spouseOnMedicare ? 1 : 0)
+    const irmaaScale = inputs.irmaaInflationAdjusted ? inflationFactor : 1
+    const irmaaResult: IrmaaResult | null =
+      medicareCount > 0
+        ? computeIrmaa({
+            lookbackMagi: irmaaLookbackMagi[year - currentYear] ?? 0,
+            married: inputs.spouseEnabled,
+            medicareCount,
+            tiers: inputs.irmaaTiers.map((t) => ({
+              ...t,
+              minMagiSingle: finiteOr(t.minMagiSingle, Infinity) * irmaaScale,
+              minMagiMFJ: finiteOr(t.minMagiMFJ, Infinity) * irmaaScale,
+              partBSurchargeMonthly: finiteOr(t.partBSurchargeMonthly, 0) * irmaaScale,
+              partDSurchargeMonthly: finiteOr(t.partDSurchargeMonthly, 0) * irmaaScale,
+            })),
+          })
+        : null
+    const irmaaTotal = irmaaResult?.total ?? 0
+
     function acaFor(otherAGI: number): AcaPtcResult | null {
       if (!acaEligible || !acaCoverage) return null
       return computePtc({
@@ -1843,6 +1889,7 @@ export function runProjection(
       0,
       committed +
         (acaResult?.netPremium ?? 0) +
+        irmaaTotal +
         ficaTax +
         initialTax.total -
         dependentCreditResult.totalCredit -
@@ -1871,6 +1918,7 @@ export function runProjection(
         0,
         committed +
           (acaResult?.netPremium ?? 0) +
+          irmaaTotal +
           ficaTax +
           iterationTax.total -
           dependentCreditResult.totalCredit -
@@ -1886,6 +1934,7 @@ export function runProjection(
 
     const ssTaxable = taxableSocialSecurityFor(plan)
     const magi = ssTaxable.otherAGI + ssBenefitTotal
+    irmaaLookbackMagi.push(ssTaxable.otherAGI + ssTaxable.federal)
     acaResult = acaFor(ssTaxable.otherAGI)
     const incomeTax = computeIncomeTaxes(
       taxSchedules,
@@ -1940,7 +1989,8 @@ export function runProjection(
         totalTax -
         savingsEmployeeTotal -
         expenseTotal -
-        (acaResult?.netPremium ?? 0),
+        (acaResult?.netPremium ?? 0) -
+        irmaaTotal,
     )
     applyWithdrawalPlan(balances, plan)
     if (catchAllLine) {
@@ -2154,6 +2204,7 @@ export function runProjection(
         taxableBasisUsed: plan.taxableBasisUsed,
         rothBasisUsed: plan.rothBasisUsed,
         college529BasisUsed: plan.college529BasisUsed,
+        college529Qualified: plan.college529Qualified,
       },
       solverConverged,
       rothConversion: { total: rothConversionTotal, self: conversionSelf, spouse: conversionSpouse },
@@ -2194,6 +2245,7 @@ export function runProjection(
             netPremium: acaResult.netPremium,
           }
         : null,
+      irmaa: irmaaResult,
       dependentCredit: {
         qualifyingChildCount: dependentCreditResult.qualifyingChildCount,
         otherDependentCount: dependentCreditResult.otherDependentCount,
